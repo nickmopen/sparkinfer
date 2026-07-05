@@ -535,6 +535,68 @@ __global__ void gate_up_mmvq2_pack2_qwen_kernel(
     if (lane == 0) h_scratch[(size_t)ts * F + f] = q4kf_silu(tg) * tu;
 }
 
+// ---- gate/up mmvq that emits the down activation ALREADY Q8_1 (SPARKINFER_GUFQ) ----
+// The MMVQ down consumes h as Q8_1, so the pipeline is gate_up -> quant_h_q8_1 -> down.
+// This folds the quantize into gate_up (the "emit-Q8_1-from-the-producer" trick #83/#86
+// used at the norm boundary), deleting the standalone quant_h pass + its h_scratch
+// global round-trip. A Q8_1 block spans 32 contiguous f, so one CUDA block owns a whole
+// 32-f tile of one expert-slot (vs one f in gate_up_mmvq2): grid collapses from
+// num_tokens*top_k*ffn to num_tokens*top_k*(ffn/32). That trades bs=1 grid width for
+// one fewer kernel — whether it nets out is an occupancy question the 5090 A/B decides,
+// so it is gated (default off) and bit-faithful to quant_h so accuracy never moves.
+// vy = Q8_1(input) (from fused norm or si_quant); math identical to gate_up_mmvq2 + quant_h.
+__global__ void gate_up_mmvq2_fused_q8_kernel(
+    const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ gate_q,
+    const unsigned char* __restrict__ up_q, const int* __restrict__ expert_ids,
+    si_block_q8_1* __restrict__ hq8, int H, int F, int top_k
+) {
+    si_pdl_lc();
+    constexpr int NW = 8;              // warps per block
+    constexpr int FPB = 32;            // f per block = one Q8_1 output block
+    constexpr int FPW = FPB / NW;      // f each warp owns (4)
+    const int ts = blockIdx.x, fb = blockIdx.y, tok = ts / top_k;
+    const int f0 = fb * FPB;
+    const int e = expert_ids[ts];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const si_block_q8_1* vrow = vy + (size_t)tok * (H >> 5);
+    const int nsuper = H >> 8;         // 256-superblocks per row
+    __shared__ float s_h[FPB];
+
+    // each warp computes FPW consecutive f (1 warp per f-row: 8 superblocks x 16 vdr
+    // positions = 128 dot items, strided 4/lane — same dp4a math as gate_up_mmvq2).
+    #pragma unroll
+    for (int i = 0; i < FPW; i++) {
+        const int fl = warp * FPW + i, f = f0 + fl;
+        const si_block_q4_K* g_row = (const si_block_q4_K*)(gate_q + ((size_t)e * F + f) * nsuper * 144);
+        const si_block_q4_K* u_row = (const si_block_q4_K*)(up_q   + ((size_t)e * F + f) * nsuper * 144);
+        float tg = 0.f, tu = 0.f;
+        for (int p = lane; p < nsuper * 16; p += 32) {
+            const int kbx = p >> 4, kqs = (p & 15) << 1;
+            tg += si_vec_dot_q4_K(g_row + kbx, vrow + kbx * 8, kqs);
+            tu += si_vec_dot_q4_K(u_row + kbx, vrow + kbx * 8, kqs);
+        }
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) { tg += __shfl_xor_sync(0xffffffff, tg, m); tu += __shfl_xor_sync(0xffffffff, tu, m); }
+        if (lane == 0) s_h[fl] = q4kf_silu(tg) * tu;
+    }
+    __syncthreads();
+
+    // quantize the 32 h to one Q8_1 block — byte-identical to quant_h_q8_1_kernel.
+    if (warp == 0) {
+        float xv = s_h[lane], a = fabsf(xv);
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, m));
+        float d = a / 127.0f;
+        int qi = (a == 0.0f) ? 0 : (int)roundf(xv / d);
+        si_block_q8_1* out = hq8 + (size_t)ts * (F >> 5) + fb;
+        out->qs[lane] = (signed char)qi;
+        int s = qi;
+        #pragma unroll
+        for (int m = 16; m > 0; m >>= 1) s += __shfl_xor_sync(0xffffffffu, s, m);
+        if (lane == 0) out->ds = __floats2half2_rn(d, d * (float)s);
+    }
+}
+
 // int8 dp4a MMVQ down (Q4_K). The Q4_K-quantized down rows in Q4_K_M were the last MoE GEMV
 // still on the fp register-dequant path (Q6_K down + gate/up + attention already run int8).
 // Reuses the Q8_1-quantized activation and the faithful vec_dot_q4_K_q8_1, one warp per
@@ -873,8 +935,43 @@ void launch_moe_expert_ffn_q4k(
     if (gu_spec < 0) { const char* gs = getenv("SPARKINFER_GU_SPEC"); gu_spec = (gs && gs[0] == '0') ? 0 : 1; }
     static int gu_pack2 = -1;
     if (gu_pack2 < 0) { const char* gp = getenv("SPARKINFER_GU_PACK2"); gu_pack2 = (gp && gp[0] == '0') ? 0 : 1; }
+
+    // down MMVQ eligibility is read here (not just in the down section below): the fused
+    // gate/up path emits Q8_1(h) only when the down that consumes it runs MMVQ.
+    static int down_mmvq = -1;
+    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    static int down_q4k = -1;
+    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
+
+    // SPARKINFER_GUFQ (default OFF): fold quant_h into gate/up, emitting Q8_1(h) directly and
+    // deleting the standalone quant_h pass + its h_scratch global round-trip. Bit-faithful to
+    // the quant_h path (accuracy can't move); a same-binary A/B (GUFQ=1 vs 0) on a 5090 decides
+    // whether that beats the bs=1 grid width it costs. Needs the 4-warp Q4_K mmvq gate/up + an
+    // MMVQ down to consume the Q8_1 it produces.
+    static int gufq = -1;
+    if (gufq < 0) { const char* fv = getenv("SPARKINFER_GUFQ"); gufq = (fv && fv[0] == '1') ? 1 : 0; }
+    const bool down_is_mmvq = down_mmvq && (down_type == 14 || (down_type == 12 && down_q4k));
+    bool h_prequantized = false;
+
     dim3 gu(num_tokens * top_k, (ffn + WPB - 1) / WPB);
-    if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
+    if (gufq && mmvq && gu2 && gate_type == 12 && up_type == 12 && down_is_mmvq) {
+        const si_block_q8_1* q;   // Q8_1(input): reuse the fused-norm one, else quantize into h_scratch (unused on this path)
+        if (input_q8) {
+            q = reinterpret_cast<const si_block_q8_1*>(input_q8);
+        } else {
+            si_block_q8_1* qbuf = reinterpret_cast<si_block_q8_1*>(h_scratch);
+            const int nqb = num_tokens * (hidden >> 5);
+            si_quant_bf16_q8_1<<<nqb, 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(input), qbuf, num_tokens * hidden);
+            q = qbuf;
+        }
+        si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // Q8_1(h) the down reads
+        dim3 fg(num_tokens * top_k, ffn >> 5);
+        gate_up_mmvq2_fused_q8_kernel<<<fg, 8 * 32, 0, stream>>>(
+            q, reinterpret_cast<const unsigned char*>(gate_q),
+            reinterpret_cast<const unsigned char*>(up_q), expert_ids, hq8, hidden, ffn, top_k);
+        h_prequantized = true;
+    } else if (mmvq && gu2 && gate_type == 12 && up_type == 12) {   // faithful 4-warp mmvq gate/up
         const si_block_q8_1* q;
         if (input_q8) {   // pre-quantized Q8_1(hn) from the fused norm: skip the quantize node
             q = reinterpret_cast<const si_block_q8_1*>(input_q8);
@@ -918,15 +1015,15 @@ void launch_moe_expert_ffn_q4k(
     // fp path (gate/up + attention already run int8 MMVQ): quantize the activation h to
     // Q8_1 once (into the otherwise-unused out_scratch) and dp4a the Q6_K weights against
     // it, faithful to llama.cpp vec_dot_q6_K_q8_1.
-    static int down_mmvq = -1;
-    if (down_mmvq < 0) { const char* dv = getenv("SPARKINFER_DOWN_MMVQ"); down_mmvq = (dv && dv[0] == '0') ? 0 : 1; }
+    // down_mmvq / down_q4k are read at the top of this function (needed for the fused gate/up).
     if (down_mmvq && down_type == 14) {   // 14 = ggml Q6_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);   // <= hidden floats; fits
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb, pdl);
+        if (!h_prequantized)   // GUFQ off: gate/up wrote fp32 h_scratch, quantize it here
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, hq8, nqb, pdl);
         // split-K MMVQ down (default S=4): S warps/row -> S*H warps in flight, hiding
         // the bs=1 occupancy stall the one-warp kernel hits. Falls back to one-warp if disabled.
         const int S = down_splitk_s_q6();
@@ -947,15 +1044,14 @@ void launch_moe_expert_ffn_q4k(
 
     // int8 dp4a MMVQ down (Q4_K) — default ON; SPARKINFER_DOWN_Q4K=0 restores the fp dequant
     // down for the Q4_K rows. Same quantize-once + faithful vec_dot path as the Q6_K down.
-    static int down_q4k = -1;
-    if (down_q4k < 0) { const char* qv = getenv("SPARKINFER_DOWN_Q4K"); down_q4k = (qv && qv[0] == '0') ? 0 : 1; }
     if (down_mmvq && down_q4k && down_type == 12) {   // 12 = ggml Q4_K
         si_block_q8_1* hq8 = reinterpret_cast<si_block_q8_1*>(out_scratch);
         const int nqb = num_tokens * top_k * (ffn >> 5);
         const int qthreads = 256;
         const int pdl = down_mmvq_pdl();
-        quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
-            h_scratch, hq8, nqb, pdl);
+        if (!h_prequantized)   // GUFQ off: quantize the fp32 h_scratch the gate/up wrote
+            quant_h_q8_1_kernel<<<(nqb + (qthreads >> 5) - 1) / (qthreads >> 5), qthreads, 0, stream>>>(
+                h_scratch, hq8, nqb, pdl);
         const int S = down_splitk_s_q4();
         if (S > 1) {
             const int RPB = WPB / S;
