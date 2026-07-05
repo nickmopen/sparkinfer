@@ -127,10 +127,15 @@ struct Qwen35Model::Impl {
     float *mf_logits = nullptr, *mf_weights = nullptr, *mf_h = nullptr, *mf_out = nullptr;
     int   *mf_ids = nullptr, *mf_counts = nullptr;
     // flash-decoding (KV-split) attention partials
-    static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
+    static constexpr int MAX_NSPLITS = 512;   // partials sized for this; adaptive n_splits <= this.
+                                              // 512 lets long-context n_splits fill the 5090 (170 SMs x
+                                              // 5 blocks/SM ~= 850 concurrent blocks; grid = 2 kv_heads x
+                                              // n_splits, so 128 splits = only 256 blocks ~= 30% occupancy).
     int n_splits = 32;
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
+    int adaptive_mid = 128;                   // n_splits for mid context (seqlen > 2*chunk); SPARKINFER_NS_MID
+    int adaptive_hi  = 256;                   // n_splits for long context (seqlen > 64*chunk); SPARKINFER_NS_HI
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
     // pre-quantized Q8_1 activation (computed once per projection input, shared across Q/K/V)
     signed char* aq8 = nullptr; float *aq8_d = nullptr, *aq8_s = nullptr;
@@ -155,13 +160,17 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     // value — empty splits contribute zero), and it's baked into the decode CUDA graph
     // at construction. 16 over-subscribes the GPU for short context (32 q_heads * 16 =
     // 512 single-warp blocks); SPARKINFER_NSPLITS lets the scored regime be tuned/swept
-    // without a rebuild. Clamp to [1, 64]; buffers below are sized from it.
+    // without a rebuild. Clamp to [1, MAX_NSPLITS]; buffers below are sized from it.
     if (const char* ns = getenv("SPARKINFER_NSPLITS")) {
         int v = atoi(ns); if (v < 1) v = 1; if (v > Impl::MAX_NSPLITS) v = Impl::MAX_NSPLITS; p_->n_splits = v;
         p_->adaptive_splits = false;   // fixed n_splits (A/B/sweeps)
         fprintf(stderr, "[nsplits] flash-decode splits = %d (fixed env override)\n", v);
     }
     if (const char* c = getenv("SPARKINFER_SPLIT_CHUNK")) { int v = atoi(c); if (v > 0) p_->split_chunk = v; }
+    // Adaptive-tier n_splits overrides — sweep these to find the occupancy sweet spot at each scored
+    // context without disabling adaptivity, then bake the winners into the defaults above.
+    if (const char* e = getenv("SPARKINFER_NS_MID")) { int v = atoi(e); if (v > 0) p_->adaptive_mid = (v > Impl::MAX_NSPLITS) ? Impl::MAX_NSPLITS : v; }
+    if (const char* e = getenv("SPARKINFER_NS_HI"))  { int v = atoi(e); if (v > 0) p_->adaptive_hi  = (v > Impl::MAX_NSPLITS) ? Impl::MAX_NSPLITS : v; }
     p_->qdim = cfg.n_q_heads * cfg.head_dim;
     p_->kvdim = cfg.n_kv_heads * cfg.head_dim;
     p_->linear_qdim = cfg.linear_q_heads * cfg.linear_head_dim;
@@ -289,8 +298,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // MAX_NSPLITS, and the online-softmax combine is exact for any split count (accuracy unchanged).
     if (s.adaptive_splits) {
         int want = 32;
-        if ((long)seqlen > 2L * s.split_chunk) want = 128;
-        if ((long)seqlen > 64L * s.split_chunk) want = Impl::MAX_NSPLITS;
+        if ((long)seqlen > 2L * s.split_chunk) want = s.adaptive_mid;   // default 128 (unchanged)
+        if ((long)seqlen > 64L * s.split_chunk) want = s.adaptive_hi;   // default 256 (unchanged; was MAX_NSPLITS==256)
         if (want > Impl::MAX_NSPLITS) want = Impl::MAX_NSPLITS;
         if (want != s.n_splits) {                       // changed -> invalidate the captured graph
             s.n_splits = want;
