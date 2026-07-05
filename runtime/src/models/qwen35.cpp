@@ -567,7 +567,17 @@ int Qwen35Model::forward_token(int token_id, int position) {
                 }
                 kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
             }
-            if (s.gguf) {
+            if (s.gguf && s.use_pq && s.use_llama && w.shared_gate_type == 8) {
+                // int8 Q8_0 dp4a mmvq shared expert (UD-quant): gate/up dot Q8_1(hn) — reuse the
+                // fused-norm one when fnq, else quantize — and the down dots Q8_1(sh_h). Same math as
+                // the bf16 GEMVs below, just int8 on-read (no bf16 weight expansion).
+                if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, st);
+                kernels::launch_mmvq_q80(s.aq81, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
+                kernels::launch_mmvq_q80(s.aq81, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
+                kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
+                kernels::launch_quantize_q8_1_blocks(s.sh_h, s.aq81, c.moe_ffn, st);
+                kernels::launch_mmvq_q80(s.aq81, w.shared_down, s.shared, H, c.moe_ffn, st);
+            } else if (s.gguf) {
                 // Shared expert as three coalesced GEMVs (one warp/row, full grid) instead of
                 // the single-block moe_expert_ffn kernel (1 SM, ~961us/layer -> the decode wall).
                 // gate/up: [ffn]=hn@shared_{gate,up}^T; SwiGLU folds the gate scalar d_shared_w;
@@ -929,9 +939,11 @@ bool Qwen35Model::load_gguf(const std::string& path) {
                 !expect_dims_opt(b + "ffn_gate_inp_shexp.weight", {H})) return false;
             // GGUF-native [out,in] layout (no transpose) so the shared expert runs as
             // three fast one-warp-per-row GEMVs instead of the single-block dense kernel.
-            w.shared_gate = dense(b + "ffn_gate_shexp.weight", false);   // [ffn, H]
-            w.shared_up   = dense(b + "ffn_up_shexp.weight", false);     // [ffn, H]
-            w.shared_down = dense(b + "ffn_down_shexp.weight", false);   // [H, ffn]
+            // Keep Q8_0 raw (int8 dp4a mmvq) instead of expanding to bf16; attn_w falls back to
+            // dense bf16 for any other type, so this is a no-op for non-Q8_0 shared experts.
+            w.shared_gate = attn_w(b + "ffn_gate_shexp.weight", w.shared_gate_type);   // [ffn, H]
+            w.shared_up   = attn_w(b + "ffn_up_shexp.weight",   w.shared_up_type);     // [ffn, H]
+            w.shared_down = attn_w(b + "ffn_down_shexp.weight", w.shared_down_type);   // [H, ffn]
             w.shared_gate_inp = attn_w_opt(b + "ffn_gate_inp_shexp.weight", w.shared_gate_inp_type);
             if (!w.shared_gate || !w.shared_up || !w.shared_down) return false;
         }

@@ -52,6 +52,7 @@ struct Qwen35LayerWeights {
     int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0;
     int wqkv_type = 0, wqkv_gate_type = 0, ssm_beta_type = 0, ssm_alpha_type = 0, ssm_out_type = 0;
     int shared_gate_inp_type = 0;
+    int shared_gate_type = 0, shared_up_type = 0, shared_down_type = 0;
 };
 
 struct Qwen35Weights {
