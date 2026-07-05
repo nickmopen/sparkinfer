@@ -99,6 +99,8 @@ struct Qwen35Model::Impl {
     cudaStream_t stream{};
     cudaStream_t stream_k{}, stream_v{};         // side streams for concurrent K/V projection
     cudaEvent_t ev_qkv{}, ev_k{}, ev_v{};        // fork/join events (captured into the decode graph)
+    cudaStream_t stream_shared{};                // side stream to overlap the shared expert with the routed experts
+    cudaEvent_t ev_shared_fork{}, ev_shared_join{}; // fork/join events for the shared-expert overlap
     uint64_t seq_id = 0;
     int qdim, kvdim;
     int linear_qdim = 0, linear_vdim = 0, linear_qkvdim = 0;
@@ -139,6 +141,7 @@ struct Qwen35Model::Impl {
     bool use_llama = true; // default ON: faithful llama mmvq for Q4_K attn GEMVs (+9.7%, top1 0.99). =0 disables
     bool use_q6mmvq = true;  // default ON: int8 Q6_K mmvq for attn-V upgrades + LM head. =0 disables
     bool use_qkvstream = true; // default ON: run Q/K/V projections on concurrent streams. =0 disables
+    bool use_sharedstream = false; // opt-in (SPARKINFER_SHAREDSTREAM=1): overlap the shared expert with the routed experts
     bool use_qkfuse = true;// default ON: fused per-head Q-norm + K-norm (1 kernel). =0 disables
     bool use_ropekv = true;// default ON: fused RoPE + KV-append (1 kernel vs 2). =0 disables
     bool use_attnin = true;// default ON: single fused QK-norm+RoPE+KV-append (1 kernel vs qkfuse+ropekv=2). =0 disables
@@ -172,6 +175,9 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     cudaEventCreateWithFlags(&p_->ev_qkv, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&p_->ev_k, cudaEventDisableTiming);
     cudaEventCreateWithFlags(&p_->ev_v, cudaEventDisableTiming);
+    cudaStreamCreate(&p_->stream_shared);
+    cudaEventCreateWithFlags(&p_->ev_shared_fork, cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&p_->ev_shared_join, cudaEventDisableTiming);
     const int H = cfg.hidden;
     p_->x=p_->alloc<bf16>(H); p_->xn=p_->alloc<bf16>(H);
     p_->q=p_->alloc<bf16>(p_->qdim); p_->k=p_->alloc<bf16>(p_->kvdim); p_->v=p_->alloc<bf16>(p_->kvdim);
@@ -230,6 +236,7 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
     if (const char* e = getenv("SPARKINFER_ROPEKV")) p_->use_ropekv = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_FNQ"))    p_->use_fnq   = !(e[0] == '0');
     if (const char* e = getenv("SPARKINFER_QKVSTREAM")) p_->use_qkvstream = !(e[0] == '0');
+    if (const char* e = getenv("SPARKINFER_SHAREDSTREAM")) p_->use_sharedstream = (e[0] == '1');
     if (const char* e = getenv("SPARKINFER_ATTNIN")) p_->use_attnin = !(e[0] == '0');
 }
 
@@ -254,6 +261,8 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
+    cudaEventDestroy(p_->ev_shared_join); cudaEventDestroy(p_->ev_shared_fork);
+    cudaStreamDestroy(p_->stream_shared);
     cudaStreamDestroy(p_->stream_v); cudaStreamDestroy(p_->stream_k);
     cudaStreamDestroy(p_->stream);
     delete p_;
@@ -508,6 +517,20 @@ int Qwen35Model::forward_token(int token_id, int position) {
         else
             kernels::launch_add_rmsnorm2(s.x, s.ao, w.post_attn_norm, s.h, s.hn, 1, H, c.rms_eps, st);
 
+        // Overlap the always-active shared expert with the routed experts (#89-style fork/join,
+        // captured into the decode graph). Both read hn and write separate buffers, combining only
+        // at the residual add below — pure scheduling, so the output is byte-identical. At bs=1 the
+        // routed MoE under-occupies the SMs; running the shared expert concurrently fills that idle
+        // time (aq81 is read-only shared under fnq; the non-fnq shared quant writes aq81, which the
+        // routed path never touches). Opt-in via SPARKINFER_SHAREDSTREAM=1.
+        const bool share_ov = s.use_sharedstream && c.n_shared > 0 && s.gguf;
+        cudaStream_t sst = st;
+        if (share_ov) {
+            cudaEventRecord(s.ev_shared_fork, st);                 // hn is ready on st
+            cudaStreamWaitEvent(s.stream_shared, s.ev_shared_fork, 0);
+            sst = s.stream_shared;
+        }
+
         if (w.gate_q) {   // GGUF fused: route, then dequant-on-read only the top_k experts
             kernels::launch_gemv_f32(s.hn, w.router_w, s.mf_logits, c.n_experts, c.hidden, st);  // router_w native [E,H]
             // The per-expert token counts only feed the batched-dispatch sort; the single-token
@@ -531,44 +554,50 @@ int Qwen35Model::forward_token(int token_id, int position) {
             s.engine->forward(s.hn, s.routed, 1, L, st);
         }
         if (c.n_shared > 0) {
+            // Shared expert runs on `sst`: the side stream when the overlap is on, else the main
+            // stream (sst == st) so the serial path is byte-for-byte unchanged.
             if (w.shared_gate_inp) {
                 if (s.gguf) {
                     if (s.use_pq && w.shared_gate_inp_type == 12) {
                         if (s.use_llama) {
-                            if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, st);
-                            kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                            if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, sst);
+                            kernels::launch_mmvq_q4k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, sst);
                         } else {
-                            kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, st);
+                            kernels::launch_quantize_q8_1(s.hn, s.aq8, s.aq8_d, s.aq8_s, H, sst);
                             kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s,
-                                                            w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                                                            w.shared_gate_inp, s.shared_gate_tmp, 1, H, sst);
                         }
                     } else if (s.use_pq && s.use_llama && s.use_q6mmvq && w.shared_gate_inp_type == 14) {
-                        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, st);
-                        kernels::launch_mmvq_q6k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.hn, s.aq81, H, sst);
+                        kernels::launch_mmvq_q6k(s.aq81, w.shared_gate_inp, s.shared_gate_tmp, 1, H, sst);
                     } else if (w.shared_gate_inp_type) {
-                        kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type, s.shared_gate_tmp, 1, H, st);
+                        kernels::launch_gemv_q(s.hn, w.shared_gate_inp, w.shared_gate_inp_type, s.shared_gate_tmp, 1, H, sst);
                     } else {
-                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, st);
+                        kernels::launch_gemv(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, H, sst);
                     }
                 } else {
-                    kernels::launch_gemm(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, 1, H, 1.f, 0.f, gc, st);
+                    kernels::launch_gemm(s.hn, w.shared_gate_inp, s.shared_gate_tmp, 1, 1, H, 1.f, 0.f, gc, sst);
                 }
-                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, st);
+                kernels::launch_qwen36_sigmoid_scalar(s.shared_gate_tmp, s.d_shared_w, sst);
             }
             if (s.gguf) {
                 // Shared expert as three coalesced GEMVs (one warp/row, full grid) instead of
                 // the single-block moe_expert_ffn kernel (1 SM, ~961us/layer -> the decode wall).
                 // gate/up: [ffn]=hn@shared_{gate,up}^T; SwiGLU folds the gate scalar d_shared_w;
                 // down: [H]=h@shared_down^T. GGUF-native [out,in] layout (see load_gguf).
-                kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, st);
-                kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, st);
-                kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, st);
-                kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, st);
+                kernels::launch_gemv(s.hn, w.shared_gate, s.sh_gate, c.moe_ffn, H, sst);
+                kernels::launch_gemv(s.hn, w.shared_up,   s.sh_up,   c.moe_ffn, H, sst);
+                kernels::launch_qwen36_shared_swiglu(s.sh_gate, s.sh_up, s.d_shared_w, s.sh_h, c.moe_ffn, sst);
+                kernels::launch_gemv(s.sh_h, w.shared_down, s.shared, H, c.moe_ffn, sst);
             } else {
                 // set_weights path: shared weights are [hidden,ffn]/[ffn,hidden] dense.
                 kernels::launch_moe_expert_ffn(s.hn, w.shared_gate, w.shared_up, w.shared_down,
                                                s.d_shared_ids, s.d_shared_w, s.shared,
-                                               1, 1, 1, H, c.moe_ffn, st);
+                                               1, 1, 1, H, c.moe_ffn, sst);
+            }
+            if (share_ov) {   // join: main stream waits for the shared expert before the residual add
+                cudaEventRecord(s.ev_shared_join, sst);
+                cudaStreamWaitEvent(st, s.ev_shared_join, 0);
             }
             launch_residual_add(s.routed, s.shared, s.routed, H, st);
         }
