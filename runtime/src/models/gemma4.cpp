@@ -330,7 +330,8 @@ int Gemma4Model::forward_token(int token_id, int position) {
         if (s.gguf) {
             const bool any_q4k = (w.wq_type == 12 || w.wk_type == 12 || w.wv_type == 12);
             const bool any_q6k = (w.wq_type == 14 || w.wk_type == 14 || w.wv_type == 14);
-            if (s.use_pq && s.use_llama && (any_q4k || any_q6k))
+            const bool any_q80 = (w.wq_type == 8  || w.wk_type == 8  || w.wv_type == 8);
+            if (s.use_pq && s.use_llama && (any_q4k || any_q6k || any_q80))
                 kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
             else if (s.use_pq && any_q4k)
                 kernels::launch_quantize_q8_1(s.xn, s.aq8, s.aq8_d, s.aq8_s, H, st);
@@ -340,6 +341,8 @@ int Gemma4Model::forward_token(int token_id, int position) {
                     else kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, W, y, N, H, st);
                 } else if (s.use_q6mmvq && t == 14)
                     kernels::launch_mmvq_q6k(s.aq81, W, y, N, H, st);
+                else if (s.use_pq && s.use_llama && t == 8)   // Q8_0 projections (int8 dp4a MMVQ)
+                    kernels::launch_mmvq_q80(s.aq81, W, y, N, H, st);
                 else if (t) kernels::launch_gemv_q(s.xn, W, t, y, N, H, st);
                 else kernels::launch_gemv(s.xn, W, y, N, H, st);
             };
@@ -396,6 +399,9 @@ int Gemma4Model::forward_token(int token_id, int position) {
                 kernels::launch_quantize_q8_1(s.attn, s.aq8, s.aq8_d, s.aq8_s, la.qdim, st);
                 kernels::launch_gemv_q_dp4a_pq(s.aq8, s.aq8_d, s.aq8_s, w.wo, s.ao, H, la.qdim, st);
             }
+        } else if (s.gguf && s.use_pq && s.use_llama && w.wo_type == 8) {   // Q8_0 O-proj (MMVQ)
+            kernels::launch_quantize_q8_1_blocks(s.attn, s.aq81, la.qdim, st);
+            kernels::launch_mmvq_q80(s.aq81, w.wo, s.ao, H, la.qdim, st);
         } else if (s.gguf && w.wo_type)
             kernels::launch_gemv_q(s.attn, w.wo, w.wo_type, s.ao, H, la.qdim, st);
         else if (s.gguf)
