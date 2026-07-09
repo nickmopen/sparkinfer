@@ -90,6 +90,25 @@ void launch_flash_decode_local_hd256(
     float scale, cudaStream_t stream = nullptr
 );
 
+// int8-KV LOCAL path (opt-in SPARKINFER_GEMMA4_KV_INT8). Same geometry as the
+// bf16 local decode above, but K/V are stored int8 with a per-(token, kv_head)
+// fp16 scale — halving the ~209 MB/token local KV traffic at ctx>=1024.
+void launch_gemma4_local_kv_append_int8(
+    const void* k_new, const void* v_new,
+    void* k_pool, void* v_pool, void* k_scale, void* v_scale,
+    const int* block_table, const int* write_pos,
+    int num_seqs, int num_kv_heads, int head_dim,
+    int block_size, int max_blocks_per_seq, cudaStream_t stream = nullptr
+);
+void launch_flash_decode_local_hd256_int8(
+    const void* q, const void* k_pool, const void* v_pool,
+    const void* k_scale, const void* v_scale,
+    const int* block_table, const int* seq_lens, void* out,
+    int num_seqs, int num_kv_heads,
+    int block_size, int max_blocks_per_window,
+    float scale, cudaStream_t stream = nullptr
+);
+
 // Flash-decoding (KV-split) for decode: one block per (seq, q_head, split) for
 // high SM occupancy and long-context scaling, then a combine pass. Fixed grid
 // (seq_len read in-kernel) so it is CUDA-graph capturable. head_dim=128.

@@ -15,6 +15,7 @@
 #include "sparkinfer/kernels/quant.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -51,6 +52,15 @@ struct Gemma4KVCache {
     void* k_pool = nullptr;
     void* v_pool = nullptr;
     std::vector<size_t> layer_off;   // bf16 element offset per layer in each pool
+    // Opt-in int8 KV for LOCAL layers only (SPARKINFER_GEMMA4_KV_INT8): parallel
+    // int8 K/V pools (1 byte/elem, reusing layer_off) + per-(token,kv_head) fp16
+    // scale pools. Global layers always stay bf16 in k_pool/v_pool.
+    bool  int8_local = false;
+    void* k_pool_i8 = nullptr;
+    void* v_pool_i8 = nullptr;
+    void* k_scale   = nullptr;       // __half [.. , kBlockSize, num_kv_heads] per layer
+    void* v_scale   = nullptr;
+    std::vector<size_t> scale_off;   // fp16-scale element offset per layer
     int* d_global_tables = nullptr;  // [kMaxSeqs, max_global_blocks]
     int* d_local_tables  = nullptr;  // [kMaxSeqs, kLocalBlocks]
     std::vector<int> free_blocks;
@@ -63,12 +73,15 @@ struct Gemma4KVCache {
         max_global_blocks = (c.max_seq + kBlockSize - 1) / kBlockSize;
         total_blocks = kLocalBlocks + max_global_blocks;
 
-        size_t total_elems = 0;
+        size_t total_elems = 0, total_scale = 0;
         layer_off.resize(c.n_layers);
+        scale_off.resize(c.n_layers);
         for (int L = 0; L < c.n_layers; L++) {
             layer_off[L] = total_elems;
+            scale_off[L] = total_scale;
             const auto a = gemma4_layer_attn(L, c);
             total_elems += (size_t)total_blocks * kBlockSize * a.num_kv_heads * a.head_dim;
+            total_scale += (size_t)total_blocks * kBlockSize * a.num_kv_heads;
         }
         const size_t need = total_elems * 2 * sizeof(bf16);
         if (pool_bytes < need) {
@@ -77,6 +90,16 @@ struct Gemma4KVCache {
         }
         cu(cudaMalloc(&k_pool, total_elems * sizeof(bf16)), "k pool");
         cu(cudaMalloc(&v_pool, total_elems * sizeof(bf16)), "v pool");
+        if (const char* e = getenv("SPARKINFER_GEMMA4_KV_INT8")) int8_local = (e[0] != '0');
+        if (int8_local) {
+            // int8 pool reuses layer_off (1 byte/elem); scale is one fp16 per (token,kv_head).
+            cu(cudaMalloc(&k_pool_i8, total_elems * sizeof(signed char)), "k pool i8");
+            cu(cudaMalloc(&v_pool_i8, total_elems * sizeof(signed char)), "v pool i8");
+            cu(cudaMalloc(&k_scale, total_scale * sizeof(__half)), "k scale");
+            cu(cudaMalloc(&v_scale, total_scale * sizeof(__half)), "v scale");
+            fprintf(stderr, "[gemma4-kv] int8 local KV ON (+%.1f MB pools)\n",
+                    (total_elems * 2 + total_scale * 2 * sizeof(__half)) / 1e6);
+        }
         cu(cudaMalloc(&d_global_tables, (size_t)kMaxSeqs * max_global_blocks * sizeof(int)), "g tables");
         cu(cudaMalloc(&d_local_tables,  (size_t)kMaxSeqs * kLocalBlocks * sizeof(int)), "l tables");
         free_blocks.reserve(total_blocks);
@@ -86,6 +109,7 @@ struct Gemma4KVCache {
 
     ~Gemma4KVCache() {
         cudaFree(k_pool); cudaFree(v_pool);
+        cudaFree(k_pool_i8); cudaFree(v_pool_i8); cudaFree(k_scale); cudaFree(v_scale);
         cudaFree(d_global_tables); cudaFree(d_local_tables);
     }
 
@@ -95,6 +119,10 @@ struct Gemma4KVCache {
     void* v_layer(int L) const {
         return (bf16*)v_pool + layer_off[L];
     }
+    void* k_layer_i8(int L)  const { return (signed char*)k_pool_i8 + layer_off[L]; }
+    void* v_layer_i8(int L)  const { return (signed char*)v_pool_i8 + layer_off[L]; }
+    void* k_scale_layer(int L) const { return (__half*)k_scale + scale_off[L]; }
+    void* v_scale_layer(int L) const { return (__half*)v_scale + scale_off[L]; }
 
     bool allocate(uint64_t seq_id, int num_tokens) {
         const int gneed = (num_tokens + kBlockSize - 1) / kBlockSize;
@@ -343,6 +371,15 @@ int Gemma4Model::forward_token(int token_id, int position) {
             kernels::launch_flash_decode_global_hd512(
                 s.q, kpool, vpool, gtable, s.d_seqlen, s.attn,
                 1, la.num_kv_heads, kBlockSize, s.kv->max_global_blocks, attn_scale, st);
+        } else if (s.kv->int8_local) {
+            void* kp8 = s.kv->k_layer_i8(L);   void* vp8 = s.kv->v_layer_i8(L);
+            void* ks  = s.kv->k_scale_layer(L); void* vs = s.kv->v_scale_layer(L);
+            kernels::launch_gemma4_local_kv_append_int8(
+                s.k, s.v, kp8, vp8, ks, vs, ltable, s.d_writepos_local, 1,
+                la.num_kv_heads, la.head_dim, kBlockSize, kLocalBlocks, st);
+            kernels::launch_flash_decode_local_hd256_int8(
+                s.q, kp8, vp8, ks, vs, ltable, s.d_seqlen, s.attn,
+                1, la.num_kv_heads, kBlockSize, kLocalBlocks, attn_scale, st);
         } else {
             launch_kv_append(kpool, vpool, s.k, s.v, ltable, s.d_writepos_local, 1,
                              la.num_kv_heads, la.head_dim, kBlockSize, kLocalBlocks, st);
