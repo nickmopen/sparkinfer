@@ -46,10 +46,10 @@ void launch_gemv(const void* x, const void* W, void* y, int N, int K,
 void launch_gemv_f32(const void* x, const void* W, float* y, int N, int K,
                      cudaStream_t stream = nullptr);
 
-// Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K
-// [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K). Dequantizes each block in
+// Quantized on-read GEMV: same as launch_gemv but W is GGUF-native Q4_K/Q6_K/Q8_0
+// [N,K] (wtype = ggml type id, 12=Q4_K / 14=Q6_K / 8=Q8_0). Dequantizes each block in
 // registers with a full-precision (fp32) activation dot — reads the quantized
-// bytes (4x less than bf16) with no int8 activation, so token-match is preserved.
+// bytes (2-4x less than bf16) with no int8 activation, so token-match is preserved.
 void launch_gemv_q(const void* x, const void* W, int wtype, void* y, int N, int K,
                    cudaStream_t stream = nullptr);
 void launch_gemv_q_f32(const void* x, const void* W, int wtype, float* y, int N, int K,
@@ -74,6 +74,9 @@ void launch_mmvq_q4k_f32(const void* q81, const void* W, float* y, int N, int K,
 // Same, for Q6_K weights (attn-V upgrades + LM head). q81 = block_q8_1(activation).
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
 void launch_mmvq_q6k_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
+// Q8_0 x Q8_1 dp4a mmvq (Qwen3.6 UD attention/GDN projections kept int8 on device)
+void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream = nullptr);
+void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 // 1-warp-per-row Q6_K dp4a GEMV (large-N, e.g. LM head): GEMV_WPB rows/block.
 void launch_gemv_q6k_dp4a_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream = nullptr);
 

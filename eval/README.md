@@ -1,7 +1,28 @@
-# Automatic evaluation (vast.ai)
+# Automatic evaluation (vast.ai or fixed SSH box)
 
-Provision (or reuse) a Blackwell GPU on vast.ai, build a sparkinfer submission, gate it for
-**correctness**, measure its **speed**, and assign an eval-loop **label** — automatically.
+Provision (or reuse) a Blackwell GPU on vast.ai, **or** use a fixed bare-metal box via SSH.
+Build a sparkinfer submission, gate it for **correctness**, measure its **speed**, and assign an
+eval-loop **label** — automatically.
+
+## Transport
+
+| `EVAL_TRANSPORT` | Behavior |
+|------------------|----------|
+| `vast` (default) | Full vast.ai rent / reuse / stop logic — unchanged |
+| `ssh` | Fixed box via `EVAL_SSH_HOST` + `EVAL_SSH_PORT`; vast.ai is not contacted |
+
+Copy `.env.eval.example` → `.env.eval` for local/cron config. Legacy: `EVAL_USE_VAST=0` also
+selects SSH when `EVAL_SSH_HOST` is set.
+
+```bash
+# fixed box (no vast billing):
+export EVAL_TRANSPORT=ssh EVAL_SSH_HOST=91.224.44.227 EVAL_SSH_PORT=50200
+python eval/vast_eval.py --ref main --frontier 285 --ceiling 366
+
+# vast.ai (default):
+export EVAL_TRANSPORT=vast
+python eval/vast_eval.py --reuse <instance_id> --ref main --frontier 285 --ceiling 366
+```
 
 ```
 submission (git ref) ─► build from source ─► correctness gate (token-match / KL vs llama.cpp)

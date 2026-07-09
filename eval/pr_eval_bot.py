@@ -13,10 +13,25 @@ commits and only spin the GPU when there's new work.
 
 Needs: `gh` authenticated, VAST_API_KEY saved (vastai), and the eval:* labels (eval/setup_labels.sh).
 """
-import argparse, datetime, json, os, re, subprocess, sys
+import argparse, datetime, hashlib, json, os, re, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
+
+from ssh_box import ssh_box_enabled, ssh_box_endpoint, ssh_box_arg, vast_enabled
+
+# Reuse vast_eval's SSH plumbing for the Qwen3.6 baseline bench (same box, same keys).
+# The bot shells out to vast_eval for the full accuracy-gated Qwen3-30B baseline, but
+# the Qwen3.6 primary only needs a speed sweep — a direct SSH bench is faster.
+try:
+    import importlib.util
+    _ve_spec = importlib.util.spec_from_file_location("vast_eval", os.path.join(HERE, "vast_eval.py"))
+    _ve = importlib.util.module_from_spec(_ve_spec); _ve_spec.loader.exec_module(_ve)
+    _vast_sh  = _ve.sh
+    _vast_endpoint = _ve.endpoint
+    _vast_info_of  = _ve.info_of
+except Exception:
+    _vast_sh = _vast_endpoint = _vast_info_of = None
 
 # vast_eval.py self-heals dead boxes (recreates them) and writes the working instance id here;
 # prefer it over --instance so we reuse the recreated box instead of retrying the dead one.
@@ -39,13 +54,20 @@ def _read_pin():
         v = open(PIN_FILE).read().strip()
         if v: return v
     except Exception: pass
-    return os.environ.get("VAST_DEFAULT_INSTANCE", "42682383").strip()
+    return os.environ.get("VAST_DEFAULT_INSTANCE", "44206573").strip()
 def _write_pin(iid):
     try:
         with open(PIN_FILE, "w") as f: f.write(str(iid))
     except Exception: pass
-PINNED_INSTANCE = _read_pin()
+PINNED_INSTANCE = _read_pin() if not ssh_box_enabled() else ""
 PINNED_RETRY_RC = 75   # must match vast_eval.PINNED_RETRY_RC
+
+
+def _vast_eval_transport_args(instance_id):
+    """Return CLI args for vast_eval.py: either --ssh or --reuse."""
+    if ssh_box_enabled():
+        return ["--ssh", ssh_box_arg()]
+    return ["--reuse", str(current_instance(instance_id))]
 
 # Subsystem buckets for the deterministic area:<name> label (from a PR's top-level changed
 # dirs — no AI). Categorization/display only: SN74 scoring is speedup-only (the eval:* tier),
@@ -70,12 +92,23 @@ HOLD_LABEL         = "hold"           # maintainer override: never auto-merge th
 CONTEXT_LABELS     = {"128-context", "512-context", "4k-context", "16k-context", "32k-context"}
 REGRESSION_LABELS  = {"regression-128", "regression-512", "regression-4k", "regression-16k", "regression-32k"}
 
+# Per-context guard baseline fallbacks for display when the RESULT_JSON baseline is 0.
+# Mirrors evaluate_dual.sh hardcoded defaults (used when both eval-box measurement and
+# bot env var are unavailable).
+_GUARD_BASE_FALLBACK = {
+    "guard_128_baseline": 300.16,
+    "guard_512_baseline": 296.76,
+    "guard_4k_baseline":  287.91,
+    "guard_16k_baseline": 338.55,
+    "guard_32k_baseline": 301.19,
+}
+
 # Auto-merge the round's merge-first winner — OFF unless SPARKINFER_AUTOMERGE=1. Heavily guarded:
 # the eval only verifies speed + token-match, so auto-merge is gated on labels, author standing,
 # changed paths, and branch protection (gh refuses if checks/reviews aren't satisfied).
 AUTO_MERGE_FIRST = os.environ.get("SPARKINFER_AUTOMERGE", "0") == "1"
 # Auto-merge is BLOCKED if the PR carries any of these labels:
-AUTOMERGE_BLOCK_LABELS = {"copycat", "flagged:gaming", "penalty", "needs-benchmark", "not-tested",
+AUTOMERGE_BLOCK_LABELS = {"copycat", "copycat-warn", "flagged:gaming", "penalty", "needs-benchmark", "not-tested",
                           NEEDS_REBASE_LABEL, REEVALUATE_LABEL, HOLD_LABEL, *REGRESSION_LABELS}
 # ...or touches any maintainer-owned / governance path (contributor speedups live in kernels|runtime|moe):
 AUTOMERGE_SENSITIVE = ("eval/", "bench/scripts/", ".gittensor/", ".github/", "dashboard/", "CODEOWNERS")
@@ -136,17 +169,18 @@ def block_account(login, reason):
         f.write(f"\n## {datetime.date.today().isoformat()} — `{login}` (auto-blocked)\n\n{reason}\n")
 
 # ---- copycat detection (a later PR that re-submits an earlier PR's diff) ----
-# A PR is a copycat if its added lines are largely contained in an EARLIER PR touching the same
-# file(s). Copycats are labeled `copycat`, commented (citing the original), and NOT evaluated.
-# Logged to .github/copycats.json; ANY copycat immediately blocks the author and closes the PR
-# (zero tolerance — no penalty period, no strike threshold).
+# Tiered policy (shared with eval/copycat_policy.py + copycat_guard.py):
+#   ≥85% containment → block + close; 75–84% → copycat-warn; 3 warns → block.
+from copycat_policy import COPYCAT_BLOCK, COPYCAT_WARN, MAX_WARNINGS, skip_copycat_scoring
+from copycat_guard import warn_copycat
+
 FLAG_FILE = os.path.join(ROOT, ".github", "FLAGGED.md")
 COPYCAT_LABEL = "copycat"
+COPYCAT_WARN_LABEL = "copycat-warn"
 COPYCAT_LOG = os.path.join(ROOT, ".github", "copycats.json")
-COPYCAT_CONTAINMENT = 0.80   # ≥80% of the copy's added lines also appear in the original
-COPYCAT_STRIKES = 1          # zero tolerance: the FIRST copycat denylists the author + closes the PR
-PENALTY_DAYS = 5             # (legacy; copycats now block immediately, so no penalty period applies)
-PENALTY_LABEL = "penalty"    # applied to a penalized author's PRs instead of greenlighting them
+COPYCAT_CONTAINMENT = COPYCAT_BLOCK   # back-compat alias
+PENALTY_DAYS = 5             # legacy penalty window for old log entries
+PENALTY_LABEL = "penalty"
 
 def author_penalty_until(author):
     """If `author` has an active copycat strike, return the date the penalty lifts, else None.
@@ -204,10 +238,10 @@ def push_github_state(msg):
 def flag_copycat(repo, num, original, author):
     add_label(repo, num, COPYCAT_LABEL)
     body = (f"<!-- sparkinfer-copycat -->\n## 🐈 Flagged: copycat\n\n"
-            f"This PR re-submits substantially the same diff as the earlier #{original}. "
-            f"Duplicating another contributor's work is treated as gaming the SN74 emission "
-            f"mechanism. The account has been **blocked** and this PR **closed** — zero tolerance, "
-            f"no warning. See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
+            f"This PR re-submits substantially the same diff (≥85% line overlap) as the earlier "
+            f"#{original}. Duplicating another contributor's work is treated as gaming the SN74 "
+            f"emission mechanism. The account has been **blocked** and this PR **closed**.\n\n"
+            f"See [`.github/COPYCATS.md`](../blob/main/.github/COPYCATS.md).")
     gh(["pr", "comment", str(num), "-R", repo, "--body", body])
 
 def evaluated_commits(repo, num):
@@ -332,7 +366,7 @@ def render(res, oid):
         if not tps:
             continue
         gate = "pass" if res.get(gkey, True) else "fail"
-        base = res.get(bkey) or (res.get("frontier_tps") if key == "ctx_16384_tps" else 0) or 0
+        base = res.get(bkey) or _GUARD_BASE_FALLBACK.get(bkey, 0)
         rows.append(f"| {f'{short} ' if dual else ''}{lbl} no-regression gate | {tps} tok/s"
                     f"{f' vs main {base} tok/s' if base else ''} · {gate} |")
     if res.get("ctx_2048_tps") is not None and res.get("ctx_512_tps") is None:
@@ -411,9 +445,9 @@ def push_dash(msg):
     subprocess.run(["git", "-C", ROOT, "pull", "-q", "--rebase", "origin", "main"], capture_output=True)
     subprocess.run(["git", "-C", ROOT, "push", "-q", "origin", "main"], capture_output=True)
 
-LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer-log.git")
+LOG_REPO  = os.environ.get("SPARKINFER_LOG_REPO", "https://github.com/gittensor-ai-lab/sparkinfer.git")
 LOG_DIR   = os.path.expanduser(os.environ.get("SPARKINFER_LOG_DIR", "~/.sparkinfer_log_checkout"))
-LOG_PAGE  = "https://gittensor-ai-lab.github.io/sparkinfer-log/?run="
+LOG_PAGE  = "https://github.com/gittensor-ai-lab/sparkinfer/blob/main/eval/logs/?run="
 
 def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
     """Commit this eval's raw log + result to the public sparkinfer-log repo (immutable record),
@@ -487,6 +521,34 @@ def upload_eval_log(repo, num, title, oid, res, log_text, baseline):
         print(f">> eval-log upload skipped: {e}")
         return None
 
+def _upload_polaris_receipt(receipt, repo, num, oid):
+    """Upload a signed Polaris receipt to the sparkinfer-log repo alongside the eval log.
+
+    Best-effort: never blocks the eval. Returns the URL to the receipt, or None.
+    """
+    try:
+        rid = f"{int(num):04d}-{oid[:7]}"
+        if not os.path.isdir(os.path.join(LOG_DIR, ".git")):
+            subprocess.run(["git", "clone", "-q", LOG_REPO, LOG_DIR], check=True)
+        else:
+            subprocess.run(["git", "-C", LOG_DIR, "pull", "-q", "--rebase"], check=False)
+        rundir = os.path.join(LOG_DIR, "runs", rid)
+        os.makedirs(rundir, exist_ok=True)
+        receipt_path = os.path.join(rundir, "receipt.json")
+        json.dump(receipt, open(receipt_path, "w"), indent=2)
+        subprocess.run(["git", "-C", LOG_DIR, "add", os.path.join("runs", rid, "receipt.json")],
+                       check=True)
+        subprocess.run(["git", "-C", LOG_DIR, "commit", "-q", "-m",
+                        f"polaris: #{num} {oid[:7]} receipt {receipt.get('receipt_id', '?')[:16]}"],
+                       check=False)
+        subprocess.run(["git", "-C", LOG_DIR, "push", "-q"], check=False)
+        url = f"{LOG_PAGE}{rid}"
+        print(f">> Polaris receipt uploaded to {url}")
+        return url
+    except Exception as e:
+        print(f">> Polaris receipt upload skipped: {e}")
+        return None
+
 def update_dashboard(repo, pr, areas, res, proof_url=None):
     """Upsert the PR's eval verdict into the dashboard TABLE (`prs`) only. The frontier and the
     journey (`landed`) advance only when a PR is actually MERGED — see record_merge() — so the
@@ -500,6 +562,11 @@ def update_dashboard(repo, pr, areas, res, proof_url=None):
              "top1": res.get("top1"), "kl": res.get("kl"),
              "url": f"https://github.com/{repo}/pull/{num}",
              "model": res.get("model", "")}
+    # Polaris receipt links (optional — only present when --polaris is used)
+    if res.get("polaris_receipt_url"):
+        entry["polaris_receipt_url"] = res["polaris_receipt_url"]
+    if res.get("polaris_receipt_hash"):
+        entry["polaris_receipt_hash"] = res["polaris_receipt_hash"]
     for k in ("eval_mode", "score_context", "best_context_label", "context_gains_pct",
               "regression_labels", "auto_close",
               "ctx_128_tps", "ctx_512_tps", "ctx_2048_tps", "ctx_4096_tps",
@@ -627,7 +694,17 @@ def record_merge(repo, num):
     # a clean calibrated ladder. Falls back to raw max() only if the gain wasn't recorded.
     old_f = round(data["status"].get("frontier_tps") or 0, 2)
     gain = (e.get("delta_pct") or 0) / 100.0
-    new_f = round(old_f * (1 + gain), 2) if gain > 0 else max(old_f, round(e.get("tps") or 0, 2))
+    # Safety: if the model field is missing (stale dual-eval record before the Qwen3.6 routing was
+    # added) the delta_pct may be from a different model's baseline, producing impossible gains
+    # (e.g. Qwen3.6's +50% applied to Qwen3-30B's frontier). A >30% single-step gain on Qwen3-30B
+    # is physically implausible at this stage — treat it as a routing error and fall back to raw tps.
+    model_name = str(e.get("model") or "")
+    if gain > 0.30 and not model_name.startswith("Qwen3.6"):
+        print(f">> record_merge: PR #{num} delta_pct={e.get('delta_pct')}% applied to Qwen3-30B "
+              f"frontier {old_f} is implausible (model={model_name!r}) — falling back to raw tps")
+        new_f = max(old_f, round(e.get("tps") or 0, 2))
+    else:
+        new_f = round(old_f * (1 + gain), 2) if gain > 0 else max(old_f, round(e.get("tps") or 0, 2))
     data["status"]["frontier_tps"] = new_f
     if e.get("eval_mode") == "longctx":
         _upsert_context_baselines(data, e)
@@ -770,7 +847,8 @@ def reconcile_merge_labels(repo):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--instance", type=int, required=True, help="vast.ai instance id to reuse")
+    ap.add_argument("--instance", type=int, default=0,
+                    help="vast.ai instance id (EVAL_TRANSPORT=vast only; ignored for ssh)")
     ap.add_argument("--frontier", type=float, default=0, help="DEPRECATED: scoring now uses same-box origin/main baseline")
     ap.add_argument("--ceiling", type=float, default=0)
     ap.add_argument("--repo", default="gittensor-ai-lab/sparkinfer")
@@ -780,16 +858,65 @@ def main():
     # not a passed-in frontier number — so the gain is hardware-independent and always current.
     ap.add_argument("--dual", action="store_true",
                     help="score Qwen3.6 (primary) + guard Qwen3-30B (no-regression) via evaluate_dual.sh")
+    ap.add_argument("--polaris", action="store_true",
+                    help="generate a Polaris verifiable receipt for each eval")
     args = ap.parse_args()
-    # Qwen3.6 same-box origin/main baselines (128/512/4k). Env-overridable; measured 2026-07 on RTX 5090.
+    if not ssh_box_enabled() and not args.instance:
+        ap.error("--instance is required for vast.ai transport (or set EVAL_TRANSPORT=ssh + EVAL_SSH_HOST)")
+    if ssh_box_enabled():
+        h, p = ssh_box_endpoint()
+        print(f">> eval transport: fixed SSH root@{h}:{p} (EVAL_TRANSPORT=ssh, vast.ai disabled)")
+    elif vast_enabled():
+        print(f">> eval transport: vast.ai (instance {args.instance or current_instance(0)})")
+    # Qwen3.6 same-box origin/main baselines (128/512/4k/16k/32k). Env-overridable; measured on RTX 5090.
     QWEN36_BASE = {
-        "128": float(os.environ.get("SPARKINFER_QWEN36_128", "225.24")),
-        "512": float(os.environ.get("SPARKINFER_QWEN36_512", "222.86")),
-        "4k":  float(os.environ.get("SPARKINFER_QWEN36_4K",  "212.42")),
+        "128": float(os.environ.get("SPARKINFER_QWEN36_128", "300.16")),
+        "512": float(os.environ.get("SPARKINFER_QWEN36_512", "296.76")),
+        "4k":  float(os.environ.get("SPARKINFER_QWEN36_4K",  "287.91")),
+        "16k": float(os.environ.get("SPARKINFER_QWEN36_16K", "338.55")),
+        "32k": float(os.environ.get("SPARKINFER_QWEN36_32K", "301.19")),
         "llama128": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_128", "275.81")),
         "llama512": float(os.environ.get("SPARKINFER_QWEN36_LLAMA_512", "275.61")),
         "llama4k":  float(os.environ.get("SPARKINFER_QWEN36_LLAMA_4K",  "276.30")),
     }
+
+    # --- Polaris verifiable compute ---
+    # Two modes, auto-selected:
+    #   TDX (preferred):  POLARIS_API_KEY is set → scoring runs inside Intel TDX enclave
+    #   Ed25519 (legacy): SPARKINFER_POLARIS_PRIVATE_KEY is set → bot signs attestations
+    # The private key NEVER touches the eval box — the bot signs/submits here on the bot host.
+    POLARIS_PRIVKEY = None
+    POLARIS_API_KEY = os.environ.get("POLARIS_API_KEY", "")
+    POLARIS_PUBKEY = ""  # SparkInfer's Ed25519 public key (used as e2e_pubkey for TDX)
+
+    if args.polaris:
+        import base64 as _b64
+        # Load the public key from the committed trust anchor
+        _pubkey_file = os.path.join(HERE, "polaris", "sparkinfer_eval.pub")
+        try:
+            with open(_pubkey_file) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if _line and not _line.startswith("#"):
+                        _b64.b64decode(_line)  # validate
+                        POLARIS_PUBKEY = _line
+                        break
+        except Exception:
+            pass
+
+        if POLARIS_API_KEY:
+            print(f">> Polaris TDX enabled — scoring will run inside Intel TDX enclave")
+        else:
+            _key_b64 = os.environ.get("SPARKINFER_POLARIS_PRIVATE_KEY", "")
+            if _key_b64:
+                try:
+                    POLARIS_PRIVKEY = _b64.b64decode(_key_b64)
+                    print(f">> Polaris Ed25519 enabled — receipts will be signed")
+                except Exception as e:
+                    print(f">> Polaris key load failed: {e} — attestations will NOT be signed")
+            else:
+                print(">> Polaris enabled but no POLARIS_API_KEY or SPARKINFER_POLARIS_PRIVATE_KEY set — "
+                      "attestations will be collected but NOT signed")
 
     dash = load_dash()
     frontier = dash["status"]["frontier_tps"] if dash else args.frontier   # live ledger frontier
@@ -812,25 +939,32 @@ def main():
     logged_copycats = {e["pr"] for e in copy_log}
     state_changed = False
 
-    def find_original(num):
-        """Earliest PR by a DIFFERENT author (shared file) whose added lines contain this PR's diff.
-        Self-resubmissions (same author iterating on their own earlier PR) are NOT copycats."""
+    def find_copycat_match(num):
+        """Best earlier different-author match with containment >= COPYCAT_WARN, else None."""
         files, added = fps.get(num, (set(), set()))
-        if not added: return None
+        if not added:
+            return None, 0.0
         me = pr_author.get(num, "?")
+        best_orig = None
+        best_c = 0.0
         for earlier in all_nums:
-            if earlier >= num: break
+            if earlier >= num:
+                break
             ea_login = pr_author.get(earlier, "?")
-            if ea_login == me: continue                      # ignore one's own earlier PRs
-            # A blocked copier's PR (or one already adjudicated as a copy) must NOT be usable as the
-            # "original": otherwise a copier can front-run the real author by opening an earlier-numbered
-            # PR (even an empty placeholder later force-pushed), get flagged, yet still frame the author.
-            if ea_login.lower() in denylist: continue
-            if earlier in logged_copycats: continue
+            if ea_login == me:
+                continue
+            if ea_login.lower() in denylist:
+                continue
+            if earlier in logged_copycats:
+                continue
             ef, ea = fps.get(earlier, (set(), set()))
-            if (files & ef) and containment(added, ea) >= COPYCAT_CONTAINMENT:
-                return earlier
-        return None
+            if not (files & ef):
+                continue
+            c = containment(added, ea)
+            if c >= COPYCAT_WARN and c > best_c:
+                best_c = c
+                best_orig = earlier
+        return best_orig, best_c
 
     # Collect PRs that actually need evaluation before starting the GPU instance.
     denylist = load_denylist()
@@ -849,26 +983,41 @@ def main():
             print(f"PR #{num}: BLOCKED (denylisted: {', '.join(sorted(hits))}) — flag + close, no eval")
             if not args.dry_run: close_blocked_pr(args.repo, num, hits)
             continue
-        # Gate 2 — copycat: re-submits a DIFFERENT author's earlier diff. Zero tolerance — flag,
-        # block the author, and close the PR immediately (no eval, no penalty, no strike threshold).
-        # (Self-resubmissions are excluded by find_original.)
-        original = find_original(num)
+        # Gate 2 — copycat: tiered containment vs earlier PRs (open/closed/merged).
+        original, copy_c = find_copycat_match(num)
         if original is not None:
             author = pr_author.get(num, "?")
-            print(f"PR #{num}: COPYCAT of #{original} by {pr_author.get(original,'?')} "
-                  f"(author {author}) — flag, no eval")
-            if not args.dry_run and num not in logged_copycats:
-                flag_copycat(args.repo, num, original, author)
-                copy_log.append({"pr": num, "author": author, "original": original,
-                                 "date": datetime.date.today().isoformat()})
-                logged_copycats.add(num); state_changed = True
-                strikes = sum(1 for e in copy_log if e["author"] == author)
-                if strikes >= COPYCAT_STRIKES and author.lower() not in load_denylist():
-                    print(f"  -> {author} hit {strikes} copycats — auto-blocking")
-                    block_account(author, f"Auto-blocked after {strikes} copycat PRs "
-                                  f"(#{', #'.join(str(e['pr']) for e in copy_log if e['author']==author)}).")
-                    close_blocked_pr(args.repo, num, {author})
-            continue
+            _, added = fps.get(num, (set(), set()))
+            if skip_copycat_scoring(added, copy_c):
+                print(f"PR #{num}: copycat-like #{original} at {copy_c:.0%} but too few added lines — allow eval")
+            elif copy_c >= COPYCAT_BLOCK:
+                print(f"PR #{num}: COPYCAT ≥85% of #{original} by {pr_author.get(original,'?')} "
+                      f"(author {author}) — block, no eval")
+                if not args.dry_run and num not in logged_copycats:
+                    flag_copycat(args.repo, num, original, author)
+                    copy_log.append({"pr": num, "author": author, "original": original,
+                                     "date": datetime.date.today().isoformat(), "blocked": True})
+                    logged_copycats.add(num); state_changed = True
+                    if author.lower() not in load_denylist():
+                        block_account(author, f"#{num} ≥85% copycat of #{original} ({copy_c:.0%})")
+                        close_blocked_pr(args.repo, num, {author})
+                continue
+            else:
+                print(f"PR #{num}: COPYCAT WARN {copy_c:.0%} of #{original} by {pr_author.get(original,'?')} "
+                      f"(author {author}) — warn, skip eval")
+                if not args.dry_run and num not in logged_copycats:
+                    warn_strikes = sum(1 for e in copy_log
+                                       if e.get("author") == author and not e.get("blocked", True))
+                    strike = warn_strikes + 1
+                    will_block = warn_copycat(args.repo, num, original, author, strike, copy_c)
+                    copy_log.append({"pr": num, "author": author, "original": original,
+                                     "date": datetime.date.today().isoformat(), "blocked": False,
+                                     "strike": strike, "containment": round(copy_c, 3)})
+                    logged_copycats.add(num); state_changed = True
+                    if will_block and author.lower() not in load_denylist():
+                        block_account(author, f"{MAX_WARNINGS} copycat strikes: #{num} (vs #{original})")
+                        close_blocked_pr(args.repo, num, {author})
+                continue
         areas = areas_for_pr(args.repo, num)
         print(f"PR #{num} @ {oid}: areas={sorted(areas) or ['(none)']} ref={ref}")
         if not args.dry_run: apply_area_labels(args.repo, num, areas)
@@ -925,22 +1074,20 @@ def main():
         print("--- dry-run: would evaluate (oldest-first): " +
               ", ".join(f"#{n}" for _, n, *_ in pending)); return
 
-    # Reuse the pinned stable box first (cached model, good download speed). Reset the pointer to it
-    # at the start of each run so the pin is always tried before any fallback box left from a prior run.
-    if PINNED_INSTANCE:
+    # Reuse the pinned stable box first (cached model, good download speed). Skip when on bare metal.
+    if PINNED_INSTANCE and not ssh_box_enabled():
         with open(INSTANCE_FILE, "w") as f: f.write(PINNED_INSTANCE)
 
     # --- Same-box baseline -------------------------------------------------------------------------
-    # vast boxes vary in speed, so comparing a PR's tok/s against a frontier measured on a DIFFERENT
-    # box leaks hardware variance into the delta. Build+bench origin/main on THIS box first and grade
-    # every PR against that same-box number (+ any PR that lands earlier in this run). Measured ONCE
-    # per run, not per PR — otherwise two PRs targeting the same optimization could both "beat" main.
-    base_iid = current_instance(args.instance)
-    bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"), "--reuse", str(base_iid),
+    base_iid = current_instance(args.instance) if args.instance else 0
+    bcmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
+            *_vast_eval_transport_args(args.instance),
             "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
             "--eval-mode", "longctx", "--keep"]
-    if PINNED_INSTANCE and str(base_iid) == PINNED_INSTANCE: bcmd.append("--pinned")
-    print(f">> measuring same-box baseline (origin/main) on instance {base_iid} ...")
+    if PINNED_INSTANCE and not ssh_box_enabled() and str(base_iid) == PINNED_INSTANCE:
+        bcmd.append("--pinned")
+    box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {base_iid}"
+    print(f">> measuring same-box baseline (origin/main) on {box_label} ...")
     br = subprocess.run(bcmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
     if br.returncode == PINNED_RETRY_RC:
         tail = next((l for l in reversed((br.stdout + br.stderr).splitlines()) if l.strip()), "")
@@ -987,25 +1134,50 @@ def main():
               f"Aborting; NO PRs graded. Re-run on a warm, stable box.")
         return
 
-        # In dual mode, also measure the Qwen3.6 primary's same-box origin/main baselines —
-        # the per-PR eval scores each Qwen3.6 PR directly against these, not against stale
-        # cold-start config constants (was 23.22, now measured fresh each run).
-        if args.dual:
-            print(f">> dual-mode: measuring Qwen3.6 same-box baseline on instance {base_iid} ...")
-            p36_cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"), "--reuse", str(base_iid),
-                        "--ref", "origin/main", "--frontier", "0", "--ceiling", str(args.ceiling),
-                        "--eval-mode", "longctx", "--keep"]
-            if PINNED_INSTANCE and str(base_iid) == PINNED_INSTANCE: p36_cmd.append("--pinned")
-            p36_br = subprocess.run(p36_cmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
-            p36_bl = next((l for l in p36_br.stdout.splitlines() if l.startswith("RESULT_JSON")), None)
-            p36_res = json.loads(p36_bl[len("RESULT_JSON "):]) if p36_bl else {}
-            if p36_res.get("pass") and p36_res.get("tps"):
-                QWEN36_BASE["128"] = float(p36_res.get("ctx_128_tps") or p36_res.get("tps") or 0)
-                QWEN36_BASE["512"] = float(p36_res.get("ctx_512_tps") or 0)
-                QWEN36_BASE["4k"]  = float(p36_res.get("ctx_4096_tps") or 0)
-                print(f"  Qwen3.6 same-box main: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} 4k={QWEN36_BASE['4k']} tok/s")
+    # Dual mode: bench Qwen3.6 main directly on the box — the same build the Qwen3-30B
+    # baseline already verified. No accuracy gate, just a 5-context decode sweep.
+    if args.dual and _vast_sh:
+        ssh_ep = ssh_box_endpoint()
+        if ssh_ep:
+            host, port = ssh_ep
+        elif _vast_endpoint and _vast_info_of:
+            import vastai
+            v = vastai.VastAI()
+            info = _vast_info_of(v, base_iid)
+            host, port = _vast_endpoint(info) if info else (None, None)
+        else:
+            host = port = None
+        if host and port:
+            M36 = "/workspace/models36/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+            B36 = "/root/sparkinfer/build/runtime/qwen3_gguf_bench"
+            tps128 = tps512 = tps4k = tps16k = tps32k = 0.0
+            for label, ctx in [("128", 0), ("512", 512), ("4k", 4096),
+                               ("16k", 16384), ("32k", 32768)]:
+                cmd = f"export PATH=/usr/local/cuda/bin:$PATH; {B36} '{M36}' 128 {ctx}"
+                r = _vast_sh(host, port, cmd, timeout=600)
+                m = re.search(r"decode\s+tg\s*:\s*([0-9.]+)", r.stdout + r.stderr)
+                if m: tps = float(m.group(1))
+                else: tps = 0.0
+                if label == "128": tps128 = tps
+                elif label == "512": tps512 = tps
+                elif label == "4k":  tps4k  = tps
+                elif label == "16k": tps16k = tps
+                else:               tps32k = tps
+                print(f"    ctx={label} tps={tps}")
+            if tps128 > 0:
+                QWEN36_BASE["128"] = tps128
+                QWEN36_BASE["512"] = tps512 if tps512 > 0 else round(tps128 * 0.98, 2)
+                QWEN36_BASE["4k"]  = tps4k  if tps4k  > 0 else round(tps128 * 0.93, 2)
+                QWEN36_BASE["16k"] = tps16k if tps16k > 0 else QWEN36_BASE["16k"]
+                QWEN36_BASE["32k"] = tps32k if tps32k > 0 else QWEN36_BASE["32k"]
+                print(f"  Qwen3.6 same-box main: 128={tps128} 512={QWEN36_BASE['512']} "
+                      f"4k={QWEN36_BASE['4k']} 16k={QWEN36_BASE['16k']} 32k={QWEN36_BASE['32k']} tok/s")
             else:
-                print(f"  Qwen3.6 baseline failed — using config defaults: 128={QWEN36_BASE['128']} 512={QWEN36_BASE['512']} 4k={QWEN36_BASE['4k']}")
+                print(f"  Qwen3.6 bench failed — using defaults: "
+                      f"{QWEN36_BASE['128']}/{QWEN36_BASE['512']}/{QWEN36_BASE['4k']}/"
+                      f"{QWEN36_BASE['16k']}/{QWEN36_BASE['32k']}")
+        else:
+            print(f"  could not reach eval box for Qwen3.6 bench — using config defaults")
 
     # Run all pending evals on the SAME instance: pass --keep so vast_eval.py never stops/destroys
     # the box mid-queue. The bot stops the instance once after ALL PRs finish (or if the instance
@@ -1018,16 +1190,17 @@ def main():
         # optimizations STACK, re-evaluate the second after merging the first. Literal duplicates are
         # caught by copycat detection; emission only pays MERGED PRs, so the maintainer's merge choice
         # (not eval order) decides what counts.
-        cur_iid = current_instance(args.instance)
+        cur_iid = current_instance(args.instance) if args.instance else 0
         cmd = [sys.executable, os.path.join(HERE, "vast_eval.py"),
-               "--reuse", str(cur_iid), "--ref", ref,
+               *_vast_eval_transport_args(args.instance),
+               "--ref", ref,
                "--frontier", "0", "--ceiling", str(args.ceiling),
                "--eval-mode", "longctx", "--guard-128-baseline", str(run_guard_128),
                "--guard-512-baseline", str(run_guard_512),
                "--guard-4k-baseline", str(run_guard_4k),
                "--guard-16k-baseline", str(run_guard_16k),
                "--guard-32k-baseline", str(run_guard_32k),
-               "--keep"]            # keep instance alive — bot stops it after all PRs
+               "--keep"]
         if args.dual:
             # Qwen3.6 scored (128/512/4k); the --guard-*-baseline above become the Qwen3-30B guard.
             # Scoring base = same-box origin/main baseline (the guard baselines), not a passed-in frontier.
@@ -1036,14 +1209,19 @@ def main():
                 "--p-guard-128-baseline", str(QWEN36_BASE["128"]),
                 "--p-guard-512-baseline", str(QWEN36_BASE["512"]),
                 "--p-guard-4k-baseline",  str(QWEN36_BASE["4k"]),
+                "--p-guard-16k-baseline", str(QWEN36_BASE["16k"]),
+                "--p-guard-32k-baseline", str(QWEN36_BASE["32k"]),
                 "--p-llama-128-baseline", str(QWEN36_BASE["llama128"]),
                 "--p-llama-512-baseline", str(QWEN36_BASE["llama512"]),
                 "--p-llama-4k-baseline",  str(QWEN36_BASE["llama4k"])]
-        if PINNED_INSTANCE and str(cur_iid) == PINNED_INSTANCE:
+        if PINNED_INSTANCE and not ssh_box_enabled() and str(cur_iid) == PINNED_INSTANCE:
             cmd.append("--pinned")  # never destroy the pin; retry-then-fallback on bring-up failure
+        if args.polaris:
+            cmd.insert(cmd.index("--keep"), "--polaris")
         pinned = "--pinned" in cmd
-        print(f"PR #{num} @ {oid}: evaluating '{ref}' (vs same-box main) on instance "
-              f"{cur_iid}{' [pinned]' if pinned else ''} ...")
+        box_label = ssh_box_arg() if ssh_box_enabled() else f"instance {cur_iid}"
+        print(f"PR #{num} @ {oid}: evaluating '{ref}' (vs same-box main) on {box_label}"
+              f"{' [pinned]' if pinned else ''} ...")
         r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=14400)
         if r.returncode == PINNED_RETRY_RC:
             tail = next((l for l in reversed((r.stdout + r.stderr).splitlines()) if l.strip()), "")
@@ -1068,6 +1246,58 @@ def main():
         else:
             res = json.loads(line[len("RESULT_JSON "):]); label = res["label"]; body = render(res, oid)
             print(f"PR #{num}: {json.dumps(res)}")
+
+            # --- Polaris: parse unsigned attestation from eval box, attest it, upload receipt ---
+            polaris_line = next((l for l in r.stdout.splitlines()
+                                 if l.startswith("POLARIS_ATTESTATION ")), None)
+            if polaris_line and res:
+                try:
+                    attestation = json.loads(polaris_line[len("POLARIS_ATTESTATION "):])
+                    receipt = None
+
+                    if POLARIS_API_KEY:
+                        # --- TDX path: submit scoring to Polaris Intel TDX enclave ---
+                        from eval.polaris.receipt import build_polaris_receipt
+                        from eval.polaris.client import PolarisClient
+
+                        # Nonce binds the attestation to this specific eval
+                        nonce_input = (
+                            attestation.get("code", {}).get("commit", "") +
+                            attestation.get("references", {}).get("model_sha256", "") +
+                            attestation.get("references", {}).get("eval_seed", "")
+                        ).encode("utf-8")
+                        nonce = hashlib.sha256(nonce_input).hexdigest()[:64]
+
+                        client = PolarisClient(POLARIS_API_KEY)
+                        polaris_resp = client.attest_scoring(
+                            attestation.get("measurements", {}),
+                            nonce,
+                            POLARIS_PUBKEY,
+                        )
+                        receipt = build_polaris_receipt(polaris_resp, attestation)
+                        print(f">> Polaris TDX: Intel verified={polaris_resp.get('tee_attestation', {}).get('verification', {}).get('intel_verified')}")
+
+                    elif POLARIS_PRIVKEY:
+                        # --- Ed25519 path: sign attestation with SparkInfer private key ---
+                        from eval.polaris.receipt import build_receipt
+                        receipt = build_receipt(attestation, POLARIS_PRIVKEY)
+                        print(f">> Polaris Ed25519: signed with SparkInfer key")
+
+                    if receipt:
+                        # Upload receipt to sparkinfer-log repo alongside the eval log
+                        receipt_url = _upload_polaris_receipt(receipt, args.repo, num, oid)
+                        if receipt_url:
+                            res["polaris_receipt_url"] = receipt_url
+                            res["polaris_receipt_hash"] = receipt["receipt_id"][:16]
+                            print(f">> Polaris receipt: {receipt_url}")
+                        else:
+                            print(">> Polaris receipt upload skipped")
+                    else:
+                        print(">> Polaris attestation collected but NOT attested (no key configured)")
+                except Exception as e:
+                    import traceback
+                    print(f">> Polaris receipt failed: {e}")
+                    traceback.print_exc()
         if args.dry_run:
             print("--- dry-run, not posting ---\n" + body); continue
         if label:
@@ -1087,10 +1317,8 @@ def main():
         if res:
             proof = upload_eval_log(args.repo, num, pr.get("title", ""), oid, res, r.stdout + r.stderr, run_baseline)
             update_dashboard(args.repo, pr, areas, res, proof_url=proof)
-            if res.get("auto_close"):
-                gh(["pr", "close", str(num), "-R", args.repo,
-                    "--comment", "Auto-closed by sparkinfer eval: no single context cleared the 2% improvement gate and at least one context regressed."])
-                print(f"PR #{num}: auto-closed after regression-only eval reject.")
+            # auto-close on REJECT is DISABLED — merge-first is the only automated action.
+            # Rejected PRs stay open so authors can rebase and re-submit.
         # NB: run_baseline is NOT ratcheted here — every PR is graded against merged origin/main, so
         # independent optimizations each get their true gain (the frontier advances on MERGE, not eval).
 
@@ -1099,11 +1327,12 @@ def main():
     if not args.dry_run:
         reconcile_merge_labels(args.repo)
 
-    # Stop (not destroy) the instance after all PRs — disk/model cache persists for next run.
-    final_iid = current_instance(args.instance)
-    if final_iid:
-        print(f">> stopping instance {final_iid} — model cache persists for next run")
-        subprocess.run(["vastai", "stop", "instance", str(final_iid)], capture_output=True)
+    # Stop vast instance after all PRs (bare-metal SSH boxes are left running).
+    if not ssh_box_enabled():
+        final_iid = current_instance(args.instance)
+        if final_iid:
+            print(f">> stopping instance {final_iid} — model cache persists for next run")
+            subprocess.run(["vastai", "stop", "instance", str(final_iid)], capture_output=True)
     print("done — no merges (manual).")
 
 if __name__ == "__main__":

@@ -1,32 +1,39 @@
 # Copycat detection & history
 
 A **copycat** PR re-submits substantially the same diff as an earlier PR (often an already-merged
-one) to farm credit for someone else's work. The eval bot detects and records them automatically.
+one) to farm credit for someone else's work. Detection runs in two places:
 
-## How it works (`eval/pr_eval_bot.py`)
+- **Real-time guard** (`eval/copycat_guard.py` + `.github/workflows/copycat-guard.yml`) — fires when a PR is opened.
+- **Eval bot** (`eval/pr_eval_bot.py`) — re-checks during scheduled evaluation.
 
-- PRs are evaluated **oldest-first** (ascending PR number), so the original is always seen before
-  any copy and the earliest submitter is graded first.
-- For each PR, the bot fingerprints the diff = (changed files, normalized non-comment added lines)
-  and compares against **every earlier PR** (open, closed, or merged).
-- A PR is a **copycat** when it shares a changed file with an earlier PR **and** ≥80% of its added
-  lines already appear in that earlier PR's diff (`COPYCAT_CONTAINMENT = 0.80`). This catches literal
-  copies while leaving genuinely different fixes of the same bug alone.
-- A copycat is labeled [`copycat`](../../labels/copycat), commented (citing the original PR), and
-  **not evaluated or scored**.
-- **First strike → 5-day eval penalty.** From the *first* copycat, the author is frozen for **5
-  days**: during the window the bot will **not** greenlight or evaluate *any* of their PRs — it
-  applies a [`penalty`](../../labels/penalty) label and skips them (already-scored PRs keep their
-  result). The window runs 5 days from the most recent strike.
-  - *Per-strike leniency:* a strike entry may set `"penalty_days"` to shorten the freeze — e.g. a
-    **first-time contributor's first mistake** who is otherwise a genuine contributor (kiannidev's
-    #54 → **2 days**). Default is 5.
-- **Two strikes → block.** The 2nd copycat by the same author auto-adds them to
-  [`blocked-contributors.txt`](./blocked-contributors.txt) with a reason (logged in
-  [`FLAGGED.md`](./FLAGGED.md)); from then on their PRs are auto-closed and never evaluated.
+Shared thresholds live in `eval/copycat_policy.py`.
 
-The machine-readable log is [`copycats.json`](./copycats.json) — one entry per detected copycat
-`{pr, author, original, date}`. It is append-only and maintained by the bot.
+## How it works
+
+- PRs are compared **oldest-first** (ascending PR number), so the original is always seen before any copy.
+- Fingerprint = (changed files, normalized non-comment added lines).
+- Compared against **every earlier PR** by a **different author** that touches the same file(s)
+  (open + merged; eval bot also includes closed).
+- **Self-resubmissions** (same author iterating on their own earlier PR) are **not** copycats.
+
+### Tiered policy
+
+| Containment | Action |
+|-------------|--------|
+| **≥ 85%** | Label [`copycat`](../../labels/copycat), **block account**, **close PR**, skip eval |
+| **75–84%** | Label [`copycat-warn`](../../labels/copycat-warn), warning comment, **skip eval** |
+| **&lt; 75%** | Pass (no copycat label) |
+
+- **3 warnings** (`copycat-warn`, any PR) within the log → auto-block + close.
+- Maintainers can clear a false positive with label `copycat-cleared` (manual).
+- **Tiny PRs** (&lt; 15 added lines) are skipped unless **≥ 98%** literal overlap.
+- **Per-function check**: a single CUDA function ≥ **92%** contained in an earlier PR → warn (catches dilution inside a larger diff).
+- **Structural similarity** and **LLM auto-warn** are **disabled** by default (too many false positives when independent contributors land similar optimizations).
+
+Blocked accounts are listed in [`blocked-contributors.txt`](./blocked-contributors.txt) and logged in [`FLAGGED.md`](./FLAGGED.md).
+
+The machine-readable log is [`copycats.json`](./copycats.json) — one entry per detection
+`{pr, author, original, date, blocked?, strike?, containment?}`.
 
 ## History
 
@@ -34,7 +41,7 @@ The machine-readable log is [`copycats.json`](./copycats.json) — one entry per
 |------|-----------|--------|-------------|------|
 | 2026-06-25 | #14 | `glorysr1209-png` | #4 (`galuis116`) | flash_prefill mask; identical 1-line diff. Account already blocked as sybil. |
 | 2026-06-25 | #9  | `glorysr1209-png` | #6 (`galuis116`) | gguf metadata desync; 7/8 added lines identical. Account already blocked as sybil. |
-| 2026-06-25 | #54 | `kiannidev` | #53 (`James-CUDA`) | maintainer-flagged: same "default split-K down + PDL" decode change as #53 (which scored `eval:none`). Below the auto containment threshold (0.50) but a duplicate attempt — strike 1 of 2. **2-day penalty** (first-time contributor, first mistake; genuine contributor of #44/#52). |
+| 2026-06-25 | #54 | `kiannidev` | #53 (`James-CUDA`) | maintainer-flagged: same decode change as #53. Below auto threshold at the time; strike 1. **2-day penalty** (first-time contributor leniency). |
 
 > `glorysr1209-png` also opened #13 and #15 (same bug-clusters as #11 / #12) but with different
 > code — not literal copies, so not logged here; they were closed under the sybil block instead.

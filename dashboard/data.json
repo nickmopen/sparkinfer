@@ -1,14 +1,14 @@
 {
-  "updated": "2026-07-06",
+  "updated": "2026-07-09",
   "status": {
     "gpu": "RTX 5090 · sm_120 · CUDA 13",
     "model": "Qwen3-30B-A3B · Q4_K_M",
-    "frontier_tps": 493.56,
+    "frontier_tps": 484.79,
     "ref_name": "llama.cpp",
     "ref_tps": 365.85,
     "vram_gb": 21.4,
-    "token_match": 0.9612,
-    "kl": 0.0175,
+    "token_match": 0.97,
+    "kl": 0.02,
     "ref_note": "128-tok decode rerun on current main, same RTX 5090 · Q4_K_M GGUF",
     "longctx_16k_tps": 330.2,
     "longctx_2k_tps": 277.78,
@@ -137,34 +137,454 @@
   ],
   "prs": [
     {
-      "num": 243,
-      "title": "perf(moe): int8 dp4a MMVQ for the Q5_K expert down projection (+6.6% Qwen3.6 decode)",
+      "num": 284,
+      "title": "perf(qwen3.6): int8 KV + tensor-core flash-decode for the hd256 full-attn layers (long-context)",
       "areas": [
         "kernels",
         "runtime"
       ],
-      "label": "REJECT",
-      "tps": 0,
-      "delta_pct": 0,
-      "top1": 0.97,
-      "kl": 0.02,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/243",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0243-79058f2"
+      "label": "M",
+      "tps": 345.7,
+      "delta_pct": 8.0,
+      "top1": 0.9848,
+      "kl": 0.014,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/284",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 32768,
+      "best_context_label": "32k-context",
+      "context_gains_pct": {
+        "128-context": 0.14,
+        "512-context": 0.03,
+        "4k-context": 0.12,
+        "16k-context": 3.43,
+        "32k-context": 8.04
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 413.09,
+      "ctx_512_tps": 405.37,
+      "ctx_4096_tps": 389.1,
+      "ctx_16384_tps": 367.97,
+      "ctx_32768_tps": 345.7,
+      "guard_128_baseline": 412.53,
+      "guard_128_ratio": 1.0014,
+      "guard_128_pass": true,
+      "guard_512_baseline": 405.25,
+      "guard_512_ratio": 1.0003,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 388.62,
+      "guard_4k_ratio": 1.0012,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 355.78,
+      "guard_16k_ratio": 1.0343,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 319.97,
+      "guard_32k_ratio": 1.0804,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0284-c78e30f"
     },
     {
-      "num": 241,
-      "title": "perf(gemv): split-K the bf16 dense projection GEMV for decode occupancy (+9.5% Qwen3.6 decode)",
+      "num": 285,
+      "title": "Opt/gdn conv l2norm",
       "areas": [
         "kernels",
         "runtime"
       ],
       "label": "REJECT",
       "tps": 0,
-      "delta_pct": 0,
-      "top1": 0.97,
-      "kl": 0.02,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/241",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0241-2aa0768"
+      "delta_pct": null,
+      "top1": 0,
+      "kl": 99,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/285",
+      "model": "",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0285-4681b82"
+    },
+    {
+      "num": 283,
+      "title": "perf(qwen3.6): fuse Q-gate + O-proj Q8_1 quantize into one launch",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 415.04,
+      "delta_pct": 0.6,
+      "top1": 0.9897,
+      "kl": 0.0177,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/283",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 0.61,
+        "512-context": 0.5,
+        "4k-context": 0.56,
+        "16k-context": 0.44,
+        "32k-context": 0.23
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 415.04,
+      "ctx_512_tps": 407.28,
+      "ctx_4096_tps": 390.79,
+      "ctx_16384_tps": 357.36,
+      "ctx_32768_tps": 320.69,
+      "guard_128_baseline": 412.53,
+      "guard_128_ratio": 1.0061,
+      "guard_128_pass": true,
+      "guard_512_baseline": 405.25,
+      "guard_512_ratio": 1.005,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 388.62,
+      "guard_4k_ratio": 1.0056,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 355.78,
+      "guard_16k_ratio": 1.0044,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 319.97,
+      "guard_32k_ratio": 1.0023,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0283-f2f973a"
+    },
+    {
+      "num": 282,
+      "title": "perf(qwen3.6): fused router GEMV + bitonic top-k (grid-completion, decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XL",
+      "tps": 427.05,
+      "delta_pct": 3.5,
+      "top1": 0.9577,
+      "kl": 0.019,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/282",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 3.52,
+        "512-context": 3.45,
+        "4k-context": 3.33,
+        "16k-context": 3.25,
+        "32k-context": 2.25
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 427.05,
+      "ctx_512_tps": 419.23,
+      "ctx_4096_tps": 401.55,
+      "ctx_16384_tps": 367.35,
+      "ctx_32768_tps": 327.16,
+      "guard_128_baseline": 412.53,
+      "guard_128_ratio": 1.0352,
+      "guard_128_pass": true,
+      "guard_512_baseline": 405.25,
+      "guard_512_ratio": 1.0345,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 388.62,
+      "guard_4k_ratio": 1.0333,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 355.78,
+      "guard_16k_ratio": 1.0325,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 319.97,
+      "guard_32k_ratio": 1.0225,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0282-bb7a2f5"
+    },
+    {
+      "num": 272,
+      "title": "perf(decode): pack2 MMVQ for attention Q4_K Wq and O projections",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 413.26,
+      "delta_pct": 0.2,
+      "top1": 0.9761,
+      "kl": 0.0194,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/272",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 0.15,
+        "512-context": 0.09,
+        "4k-context": 0.11,
+        "16k-context": 0.0,
+        "32k-context": 0.0
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 413.26,
+      "ctx_512_tps": 405.69,
+      "ctx_4096_tps": 389.42,
+      "ctx_16384_tps": 355.96,
+      "ctx_32768_tps": 319.99,
+      "guard_128_baseline": 412.63,
+      "guard_128_ratio": 1.0015,
+      "guard_128_pass": true,
+      "guard_512_baseline": 405.33,
+      "guard_512_ratio": 1.0009,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 388.98,
+      "guard_4k_ratio": 1.0011,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0272-e39923b"
+    },
+    {
+      "num": 280,
+      "title": "perf(gdn): fuse conv + L2-norm + DeltaNet AR into a single Qwen3.6 GDN megakernel",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 354.31,
+      "delta_pct": -1.9,
+      "top1": 0.9443,
+      "kl": 0.0161,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/280",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 4096,
+      "best_context_label": "4k-context",
+      "context_gains_pct": {
+        "128-context": -2.61,
+        "512-context": -2.27,
+        "4k-context": -1.95
+      },
+      "regression_labels": [
+        "regression-128",
+        "regression-512"
+      ],
+      "auto_close": true,
+      "ctx_128_tps": 373.94,
+      "ctx_512_tps": 367.97,
+      "ctx_4096_tps": 354.31,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 383.96,
+      "guard_128_ratio": 0.9739,
+      "guard_128_pass": false,
+      "guard_512_baseline": 376.53,
+      "guard_512_ratio": 0.9773,
+      "guard_512_pass": false,
+      "guard_4k_baseline": 361.34,
+      "guard_4k_ratio": 0.9805,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "guard_regression_labels": [
+        "regression-qwen3-128",
+        "regression-qwen3-512",
+        "regression-qwen3-4k"
+      ]
+    },
+    {
+      "num": 279,
+      "title": "perf(qwen36): partial-RoPE KV fuse, GDN conv-L2, Q5 S=8, Q8_0 MMVQ, addnorm3",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "S",
+      "tps": 391.17,
+      "delta_pct": 2.6,
+      "top1": 0.9505,
+      "kl": 0.0207,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/279",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "4k-context",
+      "context_gains_pct": {
+        "128-context": 2.59,
+        "512-context": 2.61,
+        "4k-context": 2.84
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 391.17,
+      "ctx_512_tps": 384.7,
+      "ctx_4096_tps": 369.78,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 381.29,
+      "guard_128_ratio": 1.0259,
+      "guard_128_pass": true,
+      "guard_512_baseline": 374.93,
+      "guard_512_ratio": 1.0261,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 359.58,
+      "guard_4k_ratio": 1.0284,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true
+    },
+    {
+      "num": 273,
+      "title": "perf(qwen3.6): fused router GEMV+top-k + folded residual-norm (decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 381.39,
+      "delta_pct": 0.1,
+      "top1": 0.967,
+      "kl": 0.0184,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/273",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 0.03,
+        "512-context": 0.26,
+        "4k-context": 0.19
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 381.39,
+      "ctx_512_tps": 375.9,
+      "ctx_4096_tps": 360.25,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 381.29,
+      "guard_128_ratio": 1.0003,
+      "guard_128_pass": true,
+      "guard_512_baseline": 374.93,
+      "guard_512_ratio": 1.0026,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 359.58,
+      "guard_4k_ratio": 1.0019,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true
+    },
+    {
+      "num": 269,
+      "title": "perf(qwen3.6): shared-expert MMVQ + QK-norm+RoPE+KV-append — 25% decode",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "XL",
+      "tps": 380.65,
+      "delta_pct": 50.9,
+      "top1": 0.9522,
+      "kl": 0.0339,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/269",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0269-666110e"
+    },
+    {
+      "num": 267,
+      "title": "perf(moe): Q5_K fp split-K Qwen specialization + gate_up F=512 dispatch (+4.3% Qwen3.6 decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "M",
+      "tps": 278.76,
+      "delta_pct": 9.4,
+      "top1": 0.9767,
+      "kl": 0.0165,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/267",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 9.44,
+        "512-context": 9.23,
+        "4k-context": 8.46
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 278.76,
+      "ctx_512_tps": 275.13,
+      "ctx_4096_tps": 259.22,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 254.72,
+      "guard_128_ratio": 1.0944,
+      "guard_128_pass": true,
+      "guard_512_baseline": 251.87,
+      "guard_512_ratio": 1.0923,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 239.0,
+      "guard_4k_ratio": 1.0846,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0267-c42844c"
+    },
+    {
+      "num": 266,
+      "title": "perf(qwen36): +15-20% decode — Q8 shared MMVQ, pipelining, F=512 MoE, hd256 FA",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "L",
+      "tps": 300.16,
+      "delta_pct": 20.5,
+      "top1": 0.9786,
+      "kl": 0.017,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/266",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 4096,
+      "best_context_label": "4k-context",
+      "context_gains_pct": {
+        "128-context": 17.84,
+        "512-context": 17.82,
+        "4k-context": 20.46
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 300.16,
+      "ctx_512_tps": 296.76,
+      "ctx_4096_tps": 287.91,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 254.72,
+      "guard_128_ratio": 1.1784,
+      "guard_128_pass": true,
+      "guard_512_baseline": 251.87,
+      "guard_512_ratio": 1.1782,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 239.0,
+      "guard_4k_ratio": 1.2046,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0266-c127774"
     },
     {
       "num": 239,
@@ -173,13 +593,204 @@
         "kernels",
         "runtime"
       ],
+      "label": "M",
+      "tps": 277.98,
+      "delta_pct": 9.1,
+      "top1": 0.9823,
+      "kl": 0.0154,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/239",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 9.13,
+        "512-context": 8.8,
+        "4k-context": 8.31
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 277.98,
+      "ctx_512_tps": 274.03,
+      "ctx_4096_tps": 258.85,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 254.72,
+      "guard_128_ratio": 1.0913,
+      "guard_128_pass": true,
+      "guard_512_baseline": 251.87,
+      "guard_512_ratio": 1.088,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 239.0,
+      "guard_4k_ratio": 1.0831,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0239-8868b7c"
+    },
+    {
+      "num": 243,
+      "title": "perf(moe): int8 dp4a MMVQ for the Q5_K expert down projection (+6.6% Qwen3.6 decode)",
+      "areas": [
+        "kernels"
+      ],
+      "label": "M",
+      "tps": 276.26,
+      "delta_pct": 8.5,
+      "top1": 0.9741,
+      "kl": 0.0132,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/243",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 8.46,
+        "512-context": 8.36,
+        "4k-context": 7.84
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 276.26,
+      "ctx_512_tps": 272.93,
+      "ctx_4096_tps": 257.73,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 254.72,
+      "guard_128_ratio": 1.0846,
+      "guard_128_pass": true,
+      "guard_512_baseline": 251.87,
+      "guard_512_ratio": 1.0836,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 239.0,
+      "guard_4k_ratio": 1.0784,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0243-d55934d"
+    },
+    {
+      "num": 240,
+      "title": "perf(qwen3.6): fast Gated-DeltaNet AR kernel + conv/L2-norm and shared-expert GEMV fusions",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "none",
+      "tps": 258.35,
+      "delta_pct": 1.4,
+      "top1": 0.9795,
+      "kl": 0.0172,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/240",
+      "model": "Qwen3.6-35B-A3B",
+      "eval_mode": "longctx",
+      "score_context": 128,
+      "best_context_label": "128-context",
+      "context_gains_pct": {
+        "128-context": 1.43,
+        "512-context": 1.32,
+        "4k-context": 1.18
+      },
+      "regression_labels": [],
+      "ctx_128_tps": 258.35,
+      "ctx_512_tps": 255.2,
+      "ctx_4096_tps": 241.82,
+      "ctx_16384_tps": 0.0,
+      "ctx_32768_tps": 0.0,
+      "guard_128_baseline": 254.72,
+      "guard_128_ratio": 1.0143,
+      "guard_128_pass": true,
+      "guard_512_baseline": 251.87,
+      "guard_512_ratio": 1.0132,
+      "guard_512_pass": true,
+      "guard_4k_baseline": 239.0,
+      "guard_4k_ratio": 1.0118,
+      "guard_4k_pass": true,
+      "guard_16k_baseline": 0.0,
+      "guard_16k_ratio": 0.0,
+      "guard_16k_pass": true,
+      "guard_32k_baseline": 0.0,
+      "guard_32k_ratio": 0.0,
+      "guard_32k_pass": true,
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0240-feb32e2"
+    },
+    {
+      "num": 264,
+      "title": "perf(qwen3.6): GDN state-update warp-per-column + overlap",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
       "label": "REJECT",
       "tps": 0,
-      "delta_pct": 0,
+      "delta_pct": -1.0,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/264",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0264-8e9a2bd"
+    },
+    {
+      "num": 260,
+      "title": "perf(qwen3.6): enable fast GDN kernel on shared-expert path",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 168.94,
+      "delta_pct": -25.0,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/260",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0260-2f143a3"
+    },
+    {
+      "num": 235,
+      "title": "perf(qwen3.6): GQA-8 flash decode for head_dim=256 (+4% @16k ctx)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 168.1,
+      "delta_pct": -25.4,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/235",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0235-e1547c3"
+    },
+    {
+      "num": 233,
+      "title": "perf(qwen36): warp-grid GDN + decode pipelining + Q8_0 shared MMVQ",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "REJECT",
+      "tps": 275.52,
+      "delta_pct": 22.3,
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/233",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0233-1cb0054"
+    },
+    {
+      "num": 241,
+      "title": "perf(gemv): split-K the bf16 dense projection GEMV for decode occupancy (+9.5% Qwen3.6 decode)",
+      "areas": [
+        "kernels",
+        "runtime"
+      ],
+      "label": "L",
+      "tps": 254.72,
+      "delta_pct": 13.1,
       "top1": 0.97,
       "kl": 0.02,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/239",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0239-cd383fb"
+      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/241",
+      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0241-2aa0768",
+      "guard_128_baseline": 225.24,
+      "guard_128_ratio": 1.130882614100515,
+      "ctx_128_tps": 254.72,
+      "ctx_512_tps": 251.87,
+      "ctx_4096_tps": 239.0
     },
     {
       "num": 237,
@@ -248,8 +859,8 @@
         "kernels"
       ],
       "label": "XL",
-      "tps": 261.3,
-      "delta_pct": 52.9,
+      "tps": 225.24,
+      "delta_pct": 31.0,
       "top1": 0.9724,
       "kl": 0.0108,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/229",
@@ -257,24 +868,24 @@
       "score_context": 128,
       "best_context_label": "128-context",
       "context_gains_pct": {
-        "128-context": 52.9,
-        "512-context": 51.9,
-        "4k-context": 48.1
+        "128-context": 31.0,
+        "512-context": 30.6,
+        "4k-context": 29.3
       },
       "regression_labels": [],
-      "ctx_128_tps": 261.3,
-      "ctx_512_tps": 258.18,
-      "ctx_4096_tps": 244.35,
+      "ctx_128_tps": 225.24,
+      "ctx_512_tps": 222.86,
+      "ctx_4096_tps": 212.42,
       "ctx_16384_tps": 0.0,
       "ctx_32768_tps": 0.0,
-      "guard_128_baseline": 170.84,
-      "guard_128_ratio": 1.5295012877546244,
+      "guard_128_baseline": 171.97,
+      "guard_128_ratio": 1.3097633308135141,
       "guard_128_pass": true,
-      "guard_512_baseline": 170.0,
-      "guard_512_ratio": 1.5187058823529411,
+      "guard_512_baseline": 170.64,
+      "guard_512_ratio": 1.3060243788091892,
       "guard_512_pass": true,
-      "guard_4k_baseline": 165.0,
-      "guard_4k_ratio": 1.480909090909091,
+      "guard_4k_baseline": 164.32,
+      "guard_4k_ratio": 1.2927215189873418,
       "guard_4k_pass": true,
       "guard_16k_baseline": 0.0,
       "guard_16k_ratio": 0.0,
@@ -992,180 +1603,6 @@
       "kl": 0.1417,
       "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/83",
       "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0083-9bf0803"
-    },
-    {
-      "num": 72,
-      "title": "perf(gemm): split-K the router projection GEMV for decode occupancy (+3% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "S",
-      "tps": 394.45,
-      "delta_pct": 3.5,
-      "top1": 0.97,
-      "kl": 0.1417,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/72",
-      "proof_url": "https://gittensor-ai-lab.github.io/sparkinfer-log/?run=0072-d459d58"
-    },
-    {
-      "num": 73,
-      "title": "perf(moe): skip the unused per-expert token count in single-token decode (+6% decode)",
-      "areas": [
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 388.68,
-      "delta_pct": 4.8,
-      "top1": 0.98,
-      "kl": 0.1453,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/73"
-    },
-    {
-      "num": 76,
-      "title": "perf(attn): fuse per-head Q/K-norm and Q/K rope into single kernels (+4.1% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 371.27,
-      "delta_pct": 4.4,
-      "top1": 0.98,
-      "kl": 0.1453,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/76"
-    },
-    {
-      "num": 67,
-      "title": "perf(moe): mmvq down split-K occupancy for M-tier decode",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 348.06,
-      "delta_pct": 0.0,
-      "top1": 0.95,
-      "kl": 0.1415,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/67"
-    },
-    {
-      "num": 75,
-      "title": "perf(moe): software-pipeline the int8 MoE down decode (+4% decode on RTX 5090)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "S",
-      "tps": 334.58,
-      "delta_pct": 4.3,
-      "top1": 0.98,
-      "kl": 0.1502,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/75"
-    },
-    {
-      "num": 74,
-      "title": "perf(moe): split-K MMVQ down — +8% Qwen3-MoE decode on RTX 5090",
-      "areas": [
-        "kernels"
-      ],
-      "label": "S",
-      "tps": 339.59,
-      "delta_pct": 5.9,
-      "top1": 0.95,
-      "kl": 0.1415,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/74"
-    },
-    {
-      "num": 71,
-      "title": "perf(moe): int8 dp4a MMVQ for the Q4_K MoE down projection (+5% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "M",
-      "tps": 333.75,
-      "delta_pct": 9.1,
-      "top1": 0.97,
-      "kl": 0.1507,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/71"
-    },
-    {
-      "num": 70,
-      "title": "int8 mmvq for the last fp32-path GEMVs: attn-V + LM head (Q6_K) + gate/up (Q4_K) (+4.3%)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "S",
-      "tps": 313.14,
-      "delta_pct": 5.3,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/70"
-    },
-    {
-      "num": 69,
-      "title": "Split-K the int8 dp4a MoE down GEMV (+3.4% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 293.62,
-      "delta_pct": 0.7,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/69"
-    },
-    {
-      "num": 65,
-      "title": "perf(moe): int8 dp4a MMVQ for the Q6_K MoE down (+4% decode)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "XS",
-      "tps": 291.58,
-      "delta_pct": 2.2,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/65"
-    },
-    {
-      "num": 64,
-      "title": "perf(moe): __ldg quantized weight reads in expert FFN decode (+1.3%)",
-      "areas": [
-        "kernels"
-      ],
-      "label": "none",
-      "tps": 289.55,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/64"
-    },
-    {
-      "num": 63,
-      "title": "Parallelize flash-decode combine + n_splits=32 (+2.7% decode)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "M",
-      "tps": 285.32,
-      "delta_pct": 2.2,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/63"
-    },
-    {
-      "num": 60,
-      "title": "perf(runtime): keep lm_head native-quantized, decode on-read (cut the largest decode read)",
-      "areas": [
-        "runtime"
-      ],
-      "label": "none",
-      "tps": 256.7,
-      "delta_pct": null,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/60"
-    },
-    {
-      "num": 59,
-      "title": "Adopt llama.cpp Q4_K mul_mat_vec_q for attention GEMVs (+9.3% decode, top-1 0.99)",
-      "areas": [
-        "kernels",
-        "runtime"
-      ],
-      "label": "L",
-      "tps": 279.11,
-      "delta_pct": 6.5,
-      "url": "https://github.com/gittensor-ai-lab/sparkinfer/pull/59"
     }
   ],
   "landed": [
@@ -1397,41 +1834,47 @@
   "qwen36": {
     "model": "Qwen3.6-35B-A3B · UD-Q4_K_M",
     "arch": "hybrid Gated-DeltaNet + full-attn MoE · 256 experts top-8 · hd256",
-    "frontier_tps": 225.24,
+    "frontier_tps": 413.09,
     "baseline_tps": 23.03,
     "ref_name": "llama.cpp",
     "ref_tps": 275.81,
-    "token_match": 0.9779,
-    "kl": 0.0183,
-    "note": "scored vs same-box main · GDN_FAST default ON · 3-rep median on RTX 5090",
+    "token_match": 0.9848,
+    "kl": 0.014,
+    "note": "scored vs same-box main · GDN_FAST default ON · #241 #243 #266 #269 #279 #284 merged",
     "ctx": [
       {
         "label": "128",
         "color": "#7B5DFF",
-        "tps": 225.24,
+        "tps": 413.09,
         "ref_tps": 275.81
       },
       {
         "label": "512",
         "color": "#0E8A16",
-        "tps": 222.86,
+        "tps": 405.37,
         "ref_tps": 275.61
       },
       {
         "label": "4k",
         "color": "#B8860B",
-        "tps": 212.42,
+        "tps": 389.1,
         "ref_tps": 276.3
+      },
+      {
+        "label": "16k",
+        "color": "#D14D72",
+        "tps": 367.97,
+        "ref_tps": 280.66
+      },
+      {
+        "label": "32k",
+        "color": "#6F42C1",
+        "tps": 345.7,
+        "ref_tps": 279.83
       }
     ]
   },
   "landed_qwen36": [
-    {
-      "name": "baseline · per-expert dequant",
-      "tps": 23.03,
-      "date": "2026-07-04",
-      "baseline": true
-    },
     {
       "name": "shared-expert coalesced GEMVs",
       "tps": 170.84,
@@ -1441,10 +1884,52 @@
     },
     {
       "name": "GDN fast AR state kernel",
-      "tps": 261.3,
+      "tps": 225.24,
       "pr": 229,
       "date": "2026-07-05",
       "label": "XL"
+    },
+    {
+      "name": "split-K bf16 dense GEMV",
+      "tps": 254.72,
+      "pr": 241,
+      "date": "2026-07-06",
+      "label": "L"
+    },
+    {
+      "name": "int8 dp4a MMVQ for the Q5_K ",
+      "tps": 276.26,
+      "pr": 243,
+      "date": "2026-07-06",
+      "label": "M"
+    },
+    {
+      "name": "+15-20% decode — Q8 shared M",
+      "tps": 300.16,
+      "pr": 266,
+      "date": "2026-07-06",
+      "label": "L"
+    },
+    {
+      "name": "shared-expert MMVQ + QK-norm",
+      "tps": 380.65,
+      "pr": 269,
+      "date": "2026-07-06",
+      "label": "XL"
+    },
+    {
+      "name": "partial-RoPE KV fuse, GDN co",
+      "tps": 391.17,
+      "pr": 279,
+      "date": "2026-07-07",
+      "label": "S"
+    },
+    {
+      "name": "int8 KV + tensor-core hd256 fl",
+      "tps": 345.7,
+      "pr": 284,
+      "date": "2026-07-09",
+      "label": "M"
     }
   ]
 }
