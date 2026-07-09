@@ -590,6 +590,39 @@ template __global__ void si_mmvq_q80_kfixed_kernel<__nv_bfloat16, 128>(const si_
 template __global__ void si_mmvq_q80_kfixed_kernel<float, 64>(const si_block_q8_1*, const unsigned char*, float*, int);
 template __global__ void si_mmvq_q80_kfixed_kernel<float, 128>(const si_block_q8_1*, const unsigned char*, float*, int);
 
+// pack2: 2 output rows per 128-thread block, each row folded by a full 64-thread (2-warp) group.
+// The kfixed<64> (K=2048) kernel above uses 128 threads but only NBLOCKS=64 of them do any dp4a
+// (threads 64-127 idle) — the single largest kernel in Qwen3.6 decode running at ~half utilization.
+// Packing 2 rows keeps all 128 threads working (64 blocks / 64 threads per row), halves the grid,
+// and reuses the shared Q8_1 activation across both rows. Math is identical to the kfixed kernel.
+template <typename OutT, int NBLOCKS>
+__global__ void si_mmvq_q80_pack2_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
+                                         OutT* __restrict__ y, int N) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;   // 4 warps
+    const int grp = warp >> 1;                                    // 0/1 : which of the 2 rows
+    const int gw  = warp & 1;                                     // 0/1 : warp within the row's 2-warp group
+    const int row = blockIdx.x * 2 + grp;
+    const int rrow = (row < N) ? row : (N - 1);                   // clamp OOB row for pointer safety only
+    const int gt  = gw * 32 + lane;                               // 0..63 : thread index within the row
+    const unsigned char* w_row = W + (size_t)rrow * NBLOCKS * 34;
+    float tmp = 0.0f;
+    #pragma unroll
+    for (int kb = gt; kb < NBLOCKS; kb += 64)
+        tmp += si_vec_dot_q8_0_mmvq(w_row + (size_t)kb * 34, vy + kb);
+    __shared__ float s[2][32];                                    // [grp][lane], written by the gw==1 warp
+    if (gw == 1) s[grp][lane] = tmp;
+    __syncthreads();                                              // all 128 threads reach this (returns are after)
+    if (gw == 1) return;
+    tmp += s[grp][lane];
+    #pragma unroll
+    for (int m = 16; m > 0; m >>= 1) tmp += __shfl_xor_sync(0xffffffff, tmp, m);
+    if (lane == 0 && row < N) gemv_write(y + row, tmp);
+}
+template __global__ void si_mmvq_q80_pack2_kernel<__nv_bfloat16, 64>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+template __global__ void si_mmvq_q80_pack2_kernel<__nv_bfloat16, 128>(const si_block_q8_1*, const unsigned char*, __nv_bfloat16*, int);
+template __global__ void si_mmvq_q80_pack2_kernel<float, 64>(const si_block_q8_1*, const unsigned char*, float*, int);
+template __global__ void si_mmvq_q80_pack2_kernel<float, 128>(const si_block_q8_1*, const unsigned char*, float*, int);
+
 template <typename OutT, int NSUPER>
 __global__ void si_mmvq_q4k_kfixed_kernel(const si_block_q8_1* __restrict__ vy, const unsigned char* __restrict__ W,
                                           OutT* __restrict__ y, int N) {
@@ -958,15 +991,15 @@ void launch_mmvq_q80(const void* q81, const void* W, void* y, int N, int K, cuda
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
     __nv_bfloat16* out = reinterpret_cast<__nv_bfloat16*>(y);
-    if (K == 2048)      si_mmvq_q80_kfixed_kernel<__nv_bfloat16, 64><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
-    else if (K == 4096) si_mmvq_q80_kfixed_kernel<__nv_bfloat16, 128><<<N, 4 * 32, 0, stream>>>(q, w, out, N);
+    if (K == 2048)      si_mmvq_q80_pack2_kernel<__nv_bfloat16, 64><<<(N + 1) / 2, 4 * 32, 0, stream>>>(q, w, out, N);
+    else if (K == 4096) si_mmvq_q80_pack2_kernel<__nv_bfloat16, 128><<<(N + 1) / 2, 4 * 32, 0, stream>>>(q, w, out, N);
     else                si_mmvq_q80_kernel<__nv_bfloat16><<<N, 4 * 32, 0, stream>>>(q, w, out, N, K);
 }
 void launch_mmvq_q80_f32(const void* q81, const void* W, float* y, int N, int K, cudaStream_t stream) {
     const si_block_q8_1* q = reinterpret_cast<const si_block_q8_1*>(q81);
     const unsigned char* w = reinterpret_cast<const unsigned char*>(W);
-    if (K == 2048)      si_mmvq_q80_kfixed_kernel<float, 64><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
-    else if (K == 4096) si_mmvq_q80_kfixed_kernel<float, 128><<<N, 4 * 32, 0, stream>>>(q, w, y, N);
+    if (K == 2048)      si_mmvq_q80_pack2_kernel<float, 64><<<(N + 1) / 2, 4 * 32, 0, stream>>>(q, w, y, N);
+    else if (K == 4096) si_mmvq_q80_pack2_kernel<float, 128><<<(N + 1) / 2, 4 * 32, 0, stream>>>(q, w, y, N);
     else                si_mmvq_q80_kernel<float><<<N, 4 * 32, 0, stream>>>(q, w, y, N, K);
 }
 void launch_mmvq_q6k(const void* q81, const void* W, void* y, int N, int K, cudaStream_t stream) {
