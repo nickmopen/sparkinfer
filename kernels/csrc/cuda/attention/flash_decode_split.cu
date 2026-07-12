@@ -321,8 +321,13 @@ template __global__ void fa_combine_kernel<256, FA_COMBINE_DG, 16>(const float*,
 // per-token/per-head fp16 scales are applied to the int32 results. This halves the KV global read (the
 // bottleneck) and uses 2x-throughput int8 tensor cores. M is padded 8->16; partials (m,l,acc) stay
 // byte-compatible with the combine kernel. sm_80+ (wmma). One block per (seq, kv_head, split); 8 warps.
+// Occupancy target (min blocks/SM). The reclaimed smem (~23 KB @ hd256) lets >5 blocks fit;
+// raising this caps registers so the compiler packs more blocks/SM — swept via -DFA_MMA_MINBLK.
+#ifndef FA_MMA_MINBLK
+#define FA_MMA_MINBLK 5
+#endif
 template <int HEAD_DIM, int GQA>
-__global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
+__global__ void __launch_bounds__(GQA * 32, FA_MMA_MINBLK) fa_split_gqa_mma_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
     const signed char* __restrict__ v_pool, const int* __restrict__ block_table,
     const int* __restrict__ seq_lens,
