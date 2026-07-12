@@ -341,10 +341,15 @@ __global__ void __launch_bounds__(GQA * 32, 5) fa_split_gqa_mma_i8_kernel(
     const int SLD = num_kv_heads;                          // scale stride (one per token, kv_head)
 
     extern __shared__ char i8smem[];
+    // Score/P' tiles span the group token width (128 = 8 blocks x 16), NOT HEAD_DIM: every access
+    // strides by 128 (QK/PV mma store ldm=128, softmax r*128+t, P' quant r*128+t). Sizing them
+    // [16][HEAD_DIM] left dead columns 128..255 at hd256 (~10 KB), capping occupancy below the
+    // __launch_bounds(,5) target. Size to the real 128 width; hd128 is unchanged (HEAD_DIM==128).
+    constexpr int SW = 128;                                           // score / P' tile width
     signed char* s_qi = reinterpret_cast<signed char*>(i8smem);       // [16][HD] quantized Q
-    signed char* s_pi = s_qi + 16 * HEAD_DIM;                         // [16][HD] quantized P'
-    float* s_s  = reinterpret_cast<float*>(s_pi + 16 * HEAD_DIM);     // [16][HD] scores / int32 mma scratch
-    float* s_o  = s_s + 16 * HEAD_DIM;                                // [GQA][HD] running O (pad rows dropped)
+    signed char* s_pi = s_qi + 16 * HEAD_DIM;                         // [16][SW] quantized P'
+    float* s_s  = reinterpret_cast<float*>(s_pi + 16 * SW);           // [16][SW] scores / int32 mma scratch
+    float* s_o  = s_s + 16 * SW;                                      // [GQA][HD] running O (pad rows dropped)
     float* s_qs = s_o + GQA * HEAD_DIM;                               // [16] Q scale
     float* s_ps = s_qs + 16;                                          // [16] P' row scale
     float* s_ks = s_ps + 16;                                          // [128] group K scales
@@ -504,7 +509,7 @@ template __global__ void fa_split_gqa_mma_i8_kernel<128, 8>(const __nv_bfloat16*
     const __half*, const __half*);
 // Qwen3.6 full-attention head_dim=256 (hybrid). The kernel is HEAD_DIM-generic (KH=HEAD_DIM/16); this
 // instantiation moves the 10 full-attn layers onto int8-KV tensor cores, halving their KV read at
-// long context. i8 smem = ~33 KB (< 48 KB dynamic cap; 5 blocks/SM fits the 5090's ~228 KB).
+// long context. i8 smem ~23 KB after reclaiming the dead score/P' cols (was ~33; < 48 KB cap).
 template __global__ void fa_split_gqa_mma_i8_kernel<256, 8>(const __nv_bfloat16*, const signed char*,
     const signed char*, const int*, const int*, float*, float*, float*, float, int, int, int, int, int,
     const __half*, const __half*);
@@ -598,9 +603,9 @@ void launch_flash_decode_split(
             constexpr int GQA = 8, TILE = FA_GQA_TILE;
             dim3 gq(num_kv_heads * n_splits, num_seqs);
             if (mma_ok256 && int8_kv) {   // int8 tensor-core hd256 — halves the KV read for the 10 full-attn layers
-                const size_t i8_smem = (size_t)2 * 16 * 256 * sizeof(signed char)
-                                     + (size_t)(16 + GQA) * 256 * sizeof(float)     // s_s[16][256] + s_o[GQA][256]
-                                     + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
+                const size_t i8_smem = (size_t)(16 * 256 + 16 * 128) * sizeof(signed char)  // s_qi[16][256] + s_pi[16][128]
+                                     + (size_t)(16 * 128 + GQA * 256) * sizeof(float)        // s_s[16][128] + s_o[GQA][256]
+                                     + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);  // ~23 KB (was ~33): dead score cols reclaimed
                 fa_split_gqa_mma_i8_kernel<256, GQA><<<gq, GQA * 32, i8_smem, stream>>>(
                     reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
                     reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
