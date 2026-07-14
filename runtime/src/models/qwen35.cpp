@@ -1109,17 +1109,29 @@ void Qwen35Model::forward_prefill_chunk(int N) {
             for (int t = 0; t < N; t++) {   // attention: per-token, causal over KV[0..t]
                 s.h_scalars[0]=0; s.h_scalars[1]=t; s.h_scalars[2]=t; s.h_scalars[3]=t+1;
                 cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4*sizeof(int), cudaMemcpyHostToDevice, st);
-                cudaMemcpyAsync(s.q, qB+(size_t)t*nq,    (size_t)nq*2,    cudaMemcpyDeviceToDevice, st);
+                bf16* qdst = w.q_has_gate ? s.qraw : s.q;   // gated Q is 2*qdim wide -> qraw
+                cudaMemcpyAsync(qdst, qB+(size_t)t*nq,    (size_t)nq*2,    cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(s.k, kB+(size_t)t*kvdim, (size_t)kvdim*2, cudaMemcpyDeviceToDevice, st);
                 cudaMemcpyAsync(s.v, vB+(size_t)t*kvdim, (size_t)kvdim*2, cudaMemcpyDeviceToDevice, st);
-                kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
-                kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
-                    btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
-                    s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
-                kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, atB+(size_t)t*qdim,
+                if (w.q_has_gate)
+                    kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
+                if (kv8) {
+                    kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                    kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
+                        btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                        s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                } else {   // bf16 KV: fused QK-norm + partial-RoPE + bf16 append
+                    kernels::launch_qknorm_rope_kv_partial(s.q, s.k, s.v, w.q_norm, w.k_norm,
+                        (bf16*)kpool, (bf16*)vpool, btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                        c.rope_dim, c.rope_theta, c.rms_eps, s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                }
+                kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, s.attn,
                     s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
                     s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, attn_scale, st,
                     nullptr, t+1, kscale, vscale, kv8?1:0, nullptr);
+                if (w.q_has_gate)
+                    kernels::launch_qwen36_mul_sigmoid(s.attn, s.qgate, qdim, st);
+                cudaMemcpyAsync(atB+(size_t)t*qdim, s.attn, (size_t)qdim*2, cudaMemcpyDeviceToDevice, st);
             }
             ck("attn-loop"); bmm(atB, w.wo, w.wo_type, aoB, N, H, qdim); ck("attn-wo");
         }
