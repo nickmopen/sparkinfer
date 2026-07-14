@@ -1054,7 +1054,9 @@ void Qwen35Model::forward_prefill_chunk(int N) {
     bf16 *gB=(bf16*)D((size_t)N*F*2), *uB=(bf16*)D((size_t)N*F*2), *actB=(bf16*)D((size_t)N*F*2);
     // dequant scratch: largest weight is FFN [F,H] or [H,F]
     bf16 *wbuf=(bf16*)D((size_t)F*H*sizeof(bf16));
-    int* tokB=(int*)D((size_t)N*sizeof(int)); cudaMemsetAsync(tokB,0,(size_t)N*sizeof(int),st); // synthetic ids
+    int* tokB=(int*)D((size_t)N*sizeof(int));
+    { std::vector<int> ht(N); for (int i=0;i<N;i++) ht[i]=(i*131+7)%c.vocab;  // deterministic varied ids
+      cudaMemcpy(tokB, ht.data(), (size_t)N*sizeof(int), cudaMemcpyHostToDevice); }
     float* dw1=(float*)D(sizeof(float)); { float one=1.f; cudaMemcpyAsync(dw1,&one,sizeof(float),cudaMemcpyHostToDevice,st); }
 
     // batched Q4_K/Q6_K/Q8_0 matmul: y[M,Nout] = x[M,K] @ W (W is GGUF [Nout,K] == [K,Nout] col-major)
@@ -1156,7 +1158,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         cudaMemcpy(B.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
         s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
         if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
-        for (int t = 0; t < Nv; t++) (void)forward_token(0, t);      // sequential (same token 0) -> s.logits
+        for (int t = 0; t < Nv; t++) (void)forward_token((t*131+7)%s.cfg.vocab, t);  // seq, SAME varied ids -> s.logits
         cudaMemcpy(A.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
         int amA=0, amB=0; double kl=0, mx=0;
         for (int i=0;i<V;i++){ if(A[i]>A[amA])amA=i; if(B[i]>B[amB])amB=i; mx=std::max(mx,(double)std::fabs(A[i]-B[i])); }
