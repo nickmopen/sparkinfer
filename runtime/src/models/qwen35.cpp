@@ -142,6 +142,7 @@ struct Qwen35Model::Impl {
     // flash-decoding (KV-split) attention partials
     static constexpr int MAX_NSPLITS = 256;   // partials sized for this; adaptive n_splits <= this
     int n_splits = 32;
+    int pf_stop = -1;   // bisection: stop the forward after this layer + lm-head (debug only)
     bool adaptive_splits = true;              // scale n_splits with seq_len (decode graph re-captured on change)
     int split_chunk = 256;                    // target serial KV per split (SPARKINFER_SPLIT_CHUNK)
     float *fa_m = nullptr, *fa_l = nullptr, *fa_acc = nullptr;
@@ -992,6 +993,7 @@ int Qwen35Model::forward_token(int token_id, int position) {
             kernels::launch_add_rmsnorm2_q8(s.h, s.routed, nextnorm, s.x, s.xn, s.aq81, H, c.rms_eps, st);
         else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
+        if (s.pf_stop >= 0 && L == s.pf_stop) break;   // bisection stop
     }
     // xn now holds RMSNorm(x_final, final_norm)
     if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
@@ -1178,6 +1180,7 @@ void Qwen35Model::forward_prefill_chunk(int N) {
 
         const void* nextnorm = (L+1 < c.n_layers) ? s.w.layers[L+1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(hB, rtB, nextnorm, xB, xnB, N, H, c.rms_eps, st);
+        if (s.pf_stop >= 0 && L == s.pf_stop) break;   // bisection stop
     }
     // last-token logits (into s.logits) — for validation + to seed decode.
     const bf16* xn_last = xnB + (size_t)(N-1)*H;
@@ -1204,6 +1207,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         const int Nv = getenv("SPARKINFER_PREFILL_VN") ? atoi(getenv("SPARKINFER_PREFILL_VN"))
                                                        : (context_tokens > 0 ? std::min(context_tokens, 512) : 256);
         const int V = s.cfg.vocab;
+        s.pf_stop = getenv("SPARKINFER_STOP_LAYER") ? atoi(getenv("SPARKINFER_STOP_LAYER")) : -1;
         std::vector<float> A(V), B(V);
         cudaGetLastError();
         forward_prefill_chunk(Nv);                                   // batched -> s.logits
@@ -1221,6 +1225,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
                 Nv, amA, A[amA], maxA, amB, B[amB], maxB, mx, amA==amB ? "ARGMAX MATCH" : "ARGMAX MISMATCH");
         s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
         if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
+        s.pf_stop = -1;   // restore full forward for the normal bench flow below
     }
     int start_pos = context_tokens;
     if (const char* e = getenv("SPARKINFER_BENCH_START_POS")) {
