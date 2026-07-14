@@ -1054,6 +1054,7 @@ void Qwen35Model::forward_prefill_chunk(int N) {
     bf16 *gB=(bf16*)D((size_t)N*F*2), *uB=(bf16*)D((size_t)N*F*2), *actB=(bf16*)D((size_t)N*F*2);
     // dequant scratch: largest weight is FFN [F,H] or [H,F]
     bf16 *wbuf=(bf16*)D((size_t)F*H*sizeof(bf16));
+    void* q8buf=D(kernels::llama_q8_1_bytes(std::max(F,H)));   // REFMM q8_1 scratch (K up to F)
     int* tokB=(int*)D((size_t)N*sizeof(int));
     { std::vector<int> ht(N); for (int i=0;i<N;i++) ht[i]=(i*131+7)%c.vocab;  // deterministic varied ids
       cudaMemcpy(tokB, ht.data(), (size_t)N*sizeof(int), cudaMemcpyHostToDevice); }
@@ -1066,10 +1067,10 @@ void Qwen35Model::forward_prefill_chunk(int N) {
             for (int m = 0; m < M; m++) {
                 const bf16* xm = x+(size_t)m*K; bf16* ym = y+(size_t)m*Nout;
                 if (t==12 || t==14 || t==8) {
-                    kernels::launch_quantize_q8_1_blocks(xm, s.aq81, K, st);
-                    if (t==12) kernels::launch_mmvq_q4k(s.aq81, W, ym, Nout, K, st);
-                    else if (t==14) kernels::launch_mmvq_q6k(s.aq81, W, ym, Nout, K, st);
-                    else kernels::launch_mmvq_q80(s.aq81, W, ym, Nout, K, st);
+                    kernels::launch_quantize_q8_1_blocks(xm, q8buf, K, st);
+                    if (t==12) kernels::launch_mmvq_q4k(q8buf, W, ym, Nout, K, st);
+                    else if (t==14) kernels::launch_mmvq_q6k(q8buf, W, ym, Nout, K, st);
+                    else kernels::launch_mmvq_q80(q8buf, W, ym, Nout, K, st);
                 } else { kernels::launch_gguf_dequant(t, W, wbuf, (long)Nout*K, st); kernels::launch_gemm(xm, wbuf, ym, 1, Nout, K, 1.f, 0.f, gc, st); }
             }
             return;
@@ -1174,7 +1175,7 @@ void Qwen35Model::forward_prefill_chunk(int N) {
     cudaStreamSynchronize(st);
     for (void* p : {(void*)xB,(void*)xnB,(void*)hB,(void*)hnB,(void*)aoB,(void*)rtB,(void*)lqkvB,(void*)lzB,
                     (void*)laB,(void*)lbB,(void*)lnB,(void*)qB,(void*)kB,(void*)vB,(void*)atB,(void*)gB,
-                    (void*)uB,(void*)actB,(void*)wbuf,(void*)tokB,(void*)dw1}) cudaFree(p);
+                    (void*)uB,(void*)actB,(void*)wbuf,(void*)q8buf,(void*)tokB,(void*)dw1}) cudaFree(p);
 }
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
