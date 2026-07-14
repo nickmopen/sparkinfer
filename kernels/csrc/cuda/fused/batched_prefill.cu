@@ -261,8 +261,9 @@ __global__ void pf_gdn_scan_kernel(const __nv_bfloat16* __restrict__ q,
     const float dt_h = pf_to_f(dt[vh]);
 
     float sloc[NROW];
+    float* cst = state + ((size_t)vh * HEAD_DIM + j) * HEAD_DIM;   // carried recurrent state
     #pragma unroll
-    for (int r = 0; r < NROW; r++) sloc[r] = 0.f;   // fresh prefill: state starts at zero
+    for (int r = 0; r < NROW; r++) sloc[r] = cst[lane + r * 32];   // continue from carried state (caller zeros for chunk 0)
 
     for (int t = 0; t < n_tokens; t++) {
         const float bb = pf_sigmoid(pf_to_f(beta[(size_t)t * v_heads + vh]));
@@ -340,12 +341,12 @@ __global__ void pf_qknorm_rope_kv_int8_kernel(
     __half* __restrict__ k_scale, __half* __restrict__ v_scale,
     const int* __restrict__ block_table,
     int n_q_heads, int n_kv_heads, int head_dim, int rotary_dim, float theta, float eps,
-    int block_size, int max_blocks_per_seq) {
+    int block_size, int max_blocks_per_seq, int pos_offset) {
     const int tok  = blockIdx.x;                    // token (grid.x avoids 65535 grid.y cap)
     const int unit = blockIdx.y;
     const int t    = threadIdx.x;
     const int rhalf = rotary_dim >> 1;
-    const int pos   = tok;                              // prefill: position == token index
+    const int pos   = tok + pos_offset;                 // chunked prefill: global position = chunk offset + token
     const int blk   = pos / block_size, within = pos % block_size;
     const int phys  = block_table[blk];                // single sequence
     const size_t ctok = (size_t)phys * block_size + within;
@@ -448,7 +449,7 @@ __global__ void pf_attn_int8_paged_kernel(
     const signed char* __restrict__ v_pool, const __half* __restrict__ k_scale,
     const __half* __restrict__ v_scale, const int* __restrict__ block_table,
     __nv_bfloat16* __restrict__ attn, int n_tokens, int n_q_heads, int n_kv_heads,
-    int block_size, int max_blocks_per_seq, float scale) {
+    int block_size, int max_blocks_per_seq, float scale, int kv_base) {
     constexpr int ELEMS = HEAD_DIM / 32;
     const int head = blockIdx.y;                    // q-head
     const int qtok = blockIdx.x;                    // query token (grid.x avoids 65535 grid.y cap)
@@ -465,7 +466,8 @@ __global__ void pf_attn_int8_paged_kernel(
     #pragma unroll
     for (int e = 0; e < ELEMS; e++) acc[e] = 0.f;
 
-    for (int kpos = 0; kpos <= qtok; kpos++) {
+    const int qglobal = qtok + kv_base;             // this query's global position (attends to all prior chunks' KV)
+    for (int kpos = 0; kpos <= qglobal; kpos++) {
         const int blk = kpos / block_size, within = kpos % block_size;
         const int phys = block_table[blk];
         const size_t ckt = ((size_t)phys * block_size + within);
@@ -576,7 +578,7 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream) {
+    int pos_offset, cudaStream_t stream) {
     dim3 grid(n_tokens, n_q_heads + 2 * n_kv_heads);   // token on grid.x
     const size_t shmem = (size_t)head_dim * sizeof(float);
     pf_qknorm_rope_kv_int8_kernel<<<grid, head_dim, shmem, stream>>>(
@@ -585,14 +587,14 @@ void launch_prefill_qknorm_rope_kv_int8(
         reinterpret_cast<const __nv_bfloat16*>(k_w), k_pool, v_pool,
         reinterpret_cast<__half*>(k_scale), reinterpret_cast<__half*>(v_scale),
         block_table, n_q_heads, n_kv_heads, head_dim, rotary_dim, theta, eps,
-        block_size, max_blocks_per_seq);
+        block_size, max_blocks_per_seq, pos_offset);
 }
 
 void launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream) {
+    int block_size, int max_blocks_per_seq, float scale, int kv_base, cudaStream_t stream) {
     dim3 grid(n_tokens, n_q_heads);   // token on grid.x
     auto qb = reinterpret_cast<const __nv_bfloat16*>(q);
     auto ks = reinterpret_cast<const __half*>(k_scale);
@@ -601,7 +603,7 @@ void launch_prefill_attn_int8_paged(
     if (head_dim == 256)
         pf_attn_int8_paged_kernel<256><<<grid, 32, 0, stream>>>(
             qb, k_pool, v_pool, ks, vs, block_table, ob, n_tokens, n_q_heads, n_kv_heads,
-            block_size, max_blocks_per_seq, scale);
+            block_size, max_blocks_per_seq, scale, kv_base);
 }
 
 } // namespace kernels

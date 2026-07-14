@@ -31,6 +31,11 @@ struct Qwen35PrefillCtx {
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n);
+// pos_offset: global position of prompt_ids[0] (for chunked prefill of long prompts).
+// do_seed: compute the last-position argmax seed (only the final chunk needs it).
+// For chunked calls the caller zeros lin_state+lin_conv_state before the first chunk; the GDN
+// scan then continues from the carried state across chunks.
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
+                        int pos_offset = 0, bool do_seed = true);
 
 } // namespace sparkinfer

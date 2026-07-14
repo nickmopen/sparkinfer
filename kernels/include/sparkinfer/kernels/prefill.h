@@ -76,7 +76,7 @@ void launch_prefill_qknorm_rope_kv_int8(
     signed char* k_pool, signed char* v_pool, void* k_scale, void* v_scale,
     const int* block_table, int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
     int rotary_dim, float theta, float eps, int block_size, int max_blocks_per_seq,
-    cudaStream_t stream = nullptr);
+    int pos_offset, cudaStream_t stream = nullptr);
 
 // Full-attention prefill: causal attention over the paged int8 KV pool just filled above.
 // One warp per (token, q-head); online softmax over keys 0..token (causal). q is the rope'd
@@ -85,6 +85,6 @@ void launch_prefill_attn_int8_paged(
     const void* q, const signed char* k_pool, const signed char* v_pool,
     const void* k_scale, const void* v_scale, const int* block_table, void* attn,
     int n_tokens, int n_q_heads, int n_kv_heads, int head_dim,
-    int block_size, int max_blocks_per_seq, float scale, cudaStream_t stream = nullptr);
+    int block_size, int max_blocks_per_seq, float scale, int kv_base, cudaStream_t stream = nullptr);
 
 }} // namespace sparkinfer::kernels

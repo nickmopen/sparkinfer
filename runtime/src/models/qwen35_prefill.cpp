@@ -44,7 +44,7 @@ struct Arena {
 };
 } // namespace
 
-int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n) {
+int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n, int pos_offset, bool do_seed) {
     const Qwen35Config& c = s.cfg;
     // Only the Qwen3.5 dense-hybrid path is supported (GGUF-native, quantized weights).
     if (!s.gguf || !c.hybrid || !c.dense_ffn || n <= 0) return -1;
@@ -146,9 +146,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
             if (!kv8) { a.free_all(); fprintf(stderr, "[prefill] batched prefill requires int8 KV\n"); return -1; }
             kernels::launch_prefill_qknorm_rope_kv_int8(qb, kf, vf, w.q_norm, w.k_norm,
                 kpool, vpool, kscale, vscale, btable, N, c.n_q_heads, c.n_kv_heads, c.head_dim,
-                rope_dim, rope_theta, eps, bs, mbs, st);
+                rope_dim, rope_theta, eps, bs, mbs, pos_offset, st);
             kernels::launch_prefill_attn_int8_paged(qb, kpool, vpool, kscale, vscale, btable, att,
-                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, st);
+                N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, attn_scale, pos_offset, st);
             kernels::launch_prefill_mul_sigmoid(att, qg, N, qdim, st);
             proj(att, w.wo, w.wo_type, ao, H, qdim);
         }
@@ -169,16 +169,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n)
         kernels::launch_rmsnorm(x, next_norm, xn, N, H, eps, st);
     }
 
-    // Seed for the first decode step: argmax at the last prompt position (xn already = final norm).
-    const bf16* xn_last = xn + (size_t)(N - 1) * H;
-    if (s.w.lm_head_type)
-        kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
-    else
-        kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);
-    kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
-    pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
-    pf_cu(cudaStreamSynchronize(st), "prefill sync");
-    int seed = *s.h_out_id;
+    // Seed for the first decode step: only the LAST chunk computes it (argmax at the last prompt
+    // position, xn already = final norm). Non-final chunks just fence so their KV/state writes
+    // complete before the scratch is freed and the next chunk runs.
+    int seed = -1;
+    if (do_seed) {
+        const bf16* xn_last = xn + (size_t)(N - 1) * H;
+        if (s.w.lm_head_type)
+            kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+        else
+            kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);
+        kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+        pf_cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "prefill seed");
+        pf_cu(cudaStreamSynchronize(st), "prefill sync");
+        seed = *s.h_out_id;
+    } else {
+        pf_cu(cudaStreamSynchronize(st), "prefill chunk sync");   // fence before free_all + next chunk
+        seed = 0;   // success sentinel for non-final chunks (-1 is reserved for failure/unsupported)
+    }
 
     a.free_all();
     return seed;

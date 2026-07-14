@@ -1064,7 +1064,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
             const char* e = getenv("SPARKINFER_PREFILL_BATCHED");
             want_batched = (e && e[0] == '0') ? 0 : 1;
             const char* mc = getenv("SPARKINFER_PREFILL_BATCHED_MAXCTX");
-            batched_maxctx = mc ? atoi(mc) : 65536;
+            batched_maxctx = mc ? atoi(mc) : 131072;   // chunked prefill bounds activation VRAM -> 128k in range
         }
         if (want_batched && s.gguf && s.cfg.hybrid && s.cfg.dense_ffn && start_pos <= batched_maxctx) {
             std::vector<int> ids(start_pos);
@@ -1127,10 +1127,26 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
 // buffers, streams and config it needs, so Impl stays private to this file.
 int Qwen35Model::prefill_batched(const int* prompt_ids, int n) {
     Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
     Qwen35PrefillCtx ctx{ s.cfg, s.w, s.kv, s.stream, s.seq_id, s.lin_state, s.lin_conv_state,
                           s.logits, s.d_out_id, s.h_out_id, s.gguf,
                           s.qdim, s.kvdim, s.linear_qdim, s.linear_vdim, s.linear_qkvdim };
-    return prefill_batched_run(ctx, prompt_ids, n);
+    // Chunked prefill: activation scratch is O(chunk) VRAM, so ≤64k chunks keep 128k within a 5090.
+    // The GDN scan now continues from carried lin_state/conv_state, so zero them ONCE before chunk 0.
+    static int C = -1;
+    if (C < 0) { const char* e = getenv("SPARKINFER_PREFILL_CHUNK"); C = e ? atoi(e) : 65536; if (C <= 0) C = 65536; }
+    cudaMemsetAsync(s.lin_state, 0,
+        (size_t)c.n_layers * c.linear_v_heads * c.linear_head_dim * c.linear_head_dim * sizeof(float), s.stream);
+    cudaMemsetAsync(s.lin_conv_state, 0,
+        (size_t)c.n_layers * (c.linear_conv_kernel - 1) * s.linear_qkvdim * sizeof(unsigned short), s.stream);
+    int seed = -1;
+    for (int off = 0; off < n; off += C) {
+        const int cn = (n - off < C) ? (n - off) : C;
+        const int r = prefill_batched_run(ctx, prompt_ids + off, cn, off, /*do_seed=*/ off + cn >= n);
+        if (r < 0) return -1;   // failure/unsupported -> caller falls back to the token loop
+        seed = r;               // the final chunk (do_seed) returns the decode seed
+    }
+    return seed;
 }
 
 std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_new, ThermalGovernor* gov) {
