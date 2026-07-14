@@ -1097,6 +1097,8 @@ void Qwen35Model::forward_prefill_chunk(int N) {
             bmm(lnB, w.ssm_out, w.ssm_out_type, aoB, N, H, lvd); ck("gdn");
         } else {
             const int nq = w.q_has_gate ? qdim*2 : qdim;
+            if (dbg && L==3) fprintf(stderr, "[pf] L3 cfg: q_has_gate=%d nq=%d qdim=%d kvdim=%d kv8=%d nsplits=%d rope_dim=%d head_dim=%d s.q_cap=%d\n",
+                (int)w.q_has_gate, nq, qdim, kvdim, (int)kv8, s.n_splits, c.rope_dim, c.head_dim, qdim);
             bmm(xnB, w.wq, w.wq_type, qB, N, nq,    H);
             bmm(xnB, w.wk, w.wk_type, kB, N, kvdim, H);
             bmm(xnB, w.wv, w.wv_type, vB, N, kvdim, H); ck("attn-proj");
