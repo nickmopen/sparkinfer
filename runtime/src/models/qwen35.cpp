@@ -1030,11 +1030,107 @@ int Qwen35Model::forward_token(int token_id, int position) {
     return *s.h_out_id;
 }
 
-// Batched prefill entry. STAGE 0: sequential fallback (correctness baseline + compile scaffold).
-// Stage 1a replaces this body with a layer-major batched forward: batched projections + dense-FFN
-// GEMMs (weights read once per layer), attention + GDN kept per-token. Fills KV for [0, n_tokens).
-void Qwen35Model::forward_prefill_chunk(int n_tokens) {
-    for (int p = 0; p < n_tokens; p++) (void)forward_token(100, p);
+// Stage 1a batched prefill (layer-major). Batched projection + dense-FFN GEMMs read each layer's
+// weights ONCE for all N tokens (dequant Q4_K -> bf16 -> launch_gemm), collapsing the per-token
+// weight-bound GEMVs. Attention (full-attn layers) and the GDN recurrence stay per-token, reusing
+// the exact decode kernels (byte-identical math). Fills KV for [0, N). NOTE: Qwythos-shaped path
+// only (dense_ffn, hybrid, head_dim 256, partial rope, int8 KV). DRAFT — validate KL vs sequential.
+void Qwen35Model::forward_prefill_chunk(int N) {
+    Impl& s = *p_;
+    const Qwen35Config& c = s.cfg;
+    const int H = c.hidden, st_dev = 0; (void)st_dev;
+    cudaStream_t st = s.stream;
+    kernels::GemmConfig gc{};
+    const int lqkv = s.linear_qkvdim, lvd = s.linear_vdim, lvh = c.linear_v_heads;
+    const int F = c.moe_ffn, kvdim = s.kvdim, qdim = s.qdim;
+
+    // --- transient batched scratch (freed at end) ---
+    auto D = [&](size_t bytes){ void* p=nullptr; cudaMalloc(&p, bytes); return p; };
+    const size_t NH = (size_t)N * H * sizeof(bf16);
+    bf16 *xB=(bf16*)D(NH), *xnB=(bf16*)D(NH), *hB=(bf16*)D(NH), *hnB=(bf16*)D(NH), *aoB=(bf16*)D(NH), *rtB=(bf16*)D(NH);
+    bf16 *lqkvB=(bf16*)D((size_t)N*lqkv*2), *lzB=(bf16*)D((size_t)N*lvd*2);
+    bf16 *laB=(bf16*)D((size_t)N*lvh*2), *lbB=(bf16*)D((size_t)N*lvh*2), *lnB=(bf16*)D((size_t)N*lvd*2);
+    bf16 *qB=(bf16*)D((size_t)N*qdim*2), *kB=(bf16*)D((size_t)N*kvdim*2), *vB=(bf16*)D((size_t)N*kvdim*2), *atB=(bf16*)D((size_t)N*qdim*2);
+    bf16 *gB=(bf16*)D((size_t)N*F*2), *uB=(bf16*)D((size_t)N*F*2), *actB=(bf16*)D((size_t)N*F*2);
+    // dequant scratch: largest weight is FFN [F,H] or [H,F]
+    bf16 *wbuf=(bf16*)D((size_t)F*H*sizeof(bf16));
+    int* tokB=(int*)D((size_t)N*sizeof(int)); cudaMemsetAsync(tokB,0,(size_t)N*sizeof(int),st); // synthetic ids
+    float* dw1=(float*)D(sizeof(float)); { float one=1.f; cudaMemcpyAsync(dw1,&one,sizeof(float),cudaMemcpyHostToDevice,st); }
+
+    // batched Q4_K/Q6_K/Q8_0 matmul: y[M,Nout] = x[M,K] @ W (W is GGUF [Nout,K] == [K,Nout] col-major)
+    auto bmm = [&](const bf16* x, const void* W, int t, bf16* y, int M, int Nout, int K){
+        kernels::launch_gguf_dequant(t, W, wbuf, (long)Nout*K, st);
+        kernels::launch_gemm(x, wbuf, y, M, Nout, K, 1.f, 0.f, gc, st);
+    };
+
+    kernels::launch_embedding(tokB, s.w.embed_tokens, xB, N, H, st);
+    kernels::launch_rmsnorm(xB, s.w.layers[0].input_norm, xnB, N, H, c.rms_eps, st);
+
+    int* btable = s.kv->block_table(s.seq_id);
+    const bool kv8 = s.kv->int8_kv();
+    const int kv_elem = kv8 ? 1 : 2;
+    const float attn_scale = 1.f / sqrtf((float)c.head_dim);
+
+    for (int L = 0; L < c.n_layers; L++) {
+        const Qwen35LayerWeights& w = s.w.layers[L];
+        if (w.linear_attn) {
+            bmm(xnB, w.wqkv,      w.wqkv_type,      lqkvB, N, lqkv, H);
+            bmm(xnB, w.wqkv_gate, w.wqkv_gate_type, lzB,  N, lvd,  H);
+            bmm(xnB, w.ssm_alpha, w.ssm_alpha_type, laB,  N, lvh,  H);
+            bmm(xnB, w.ssm_beta,  w.ssm_beta_type,  lbB,  N, lvh,  H);
+            bf16* conv_state = s.lin_conv_state + (size_t)L*(c.linear_conv_kernel-1)*s.linear_qkvdim;
+            float* lstate = s.lin_state + (size_t)L*lvh*c.linear_head_dim*c.linear_head_dim;
+            for (int t = 0; t < N; t++) {   // GDN recurrence: per-token, state carries
+                kernels::launch_qwen36_conv_split_l2(lqkvB+(size_t)t*lqkv, w.ssm_conv, conv_state,
+                    s.lin_q, s.lin_k, s.lin_v, c.linear_q_heads, lvh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
+                kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v, laB+(size_t)t*lvh, lbB+(size_t)t*lvh,
+                    w.ssm_dt, w.ssm_a, lstate, s.lin_gdn, c.linear_q_heads, lvh, c.linear_head_dim, st);
+                kernels::launch_qwen36_gated_norm(s.lin_gdn, lzB+(size_t)t*lvd, w.ssm_norm, lnB+(size_t)t*lvd,
+                    lvh, c.linear_head_dim, c.rms_eps, st);
+            }
+            bmm(lnB, w.ssm_out, w.ssm_out_type, aoB, N, H, lvd);
+        } else {
+            const int nq = w.q_has_gate ? qdim*2 : qdim;
+            bmm(xnB, w.wq, w.wq_type, qB, N, nq,    H);
+            bmm(xnB, w.wk, w.wk_type, kB, N, kvdim, H);
+            bmm(xnB, w.wv, w.wv_type, vB, N, kvdim, H);
+            void* kpool=(char*)s.kv->k_pool()+(size_t)L*s.kv->layer_stride_elems()*kv_elem;
+            void* vpool=(char*)s.kv->v_pool()+(size_t)L*s.kv->layer_stride_elems()*kv_elem;
+            void* kscale=kv8?(char*)s.kv->k_scale_pool()+(size_t)L*s.kv->scale_layer_stride_elems()*2:nullptr;
+            void* vscale=kv8?(char*)s.kv->v_scale_pool()+(size_t)L*s.kv->scale_layer_stride_elems()*2:nullptr;
+            for (int t = 0; t < N; t++) {   // attention: per-token, causal over KV[0..t]
+                s.h_scalars[0]=0; s.h_scalars[1]=t; s.h_scalars[2]=t; s.h_scalars[3]=t+1;
+                cudaMemcpyAsync(s.d_scalars, s.h_scalars, 4*sizeof(int), cudaMemcpyHostToDevice, st);
+                cudaMemcpyAsync(s.q, qB+(size_t)t*nq,    (size_t)nq*2,    cudaMemcpyDeviceToDevice, st);
+                cudaMemcpyAsync(s.k, kB+(size_t)t*kvdim, (size_t)kvdim*2, cudaMemcpyDeviceToDevice, st);
+                cudaMemcpyAsync(s.v, vB+(size_t)t*kvdim, (size_t)kvdim*2, cudaMemcpyDeviceToDevice, st);
+                kernels::launch_rmsnorm_qk(s.q, s.k, w.q_norm, w.k_norm, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rms_eps, st);
+                kernels::launch_rope_kv_append_partial_int8(s.q, s.k, s.v, kpool, vpool, kscale, vscale,
+                    btable, s.d_pos, 1, c.n_q_heads, c.n_kv_heads, c.head_dim, c.rope_dim, c.rope_theta,
+                    s.kv->block_size(), s.kv->max_blocks_per_seq(), st);
+                kernels::launch_flash_decode_split(s.q, kpool, vpool, btable, s.d_seqlen, atB+(size_t)t*qdim,
+                    s.fa_m, s.fa_l, s.fa_acc, 1, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                    s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, attn_scale, st,
+                    nullptr, t+1, kscale, vscale, kv8?1:0, nullptr);
+            }
+            bmm(atB, w.wo, w.wo_type, aoB, N, H, qdim);
+        }
+        kernels::launch_add_rmsnorm2(xB, aoB, w.post_attn_norm, hB, hnB, N, H, c.rms_eps, st);
+
+        // dense FFN, batched: gate/up GEMM -> swiglu -> down GEMM
+        bmm(hnB, w.gate_q, w.gate_qtype, gB, N, F, H);
+        bmm(hnB, w.up_q,   w.up_qtype,   uB, N, F, H);
+        for (int t = 0; t < N; t++)
+            kernels::launch_qwen36_shared_swiglu(gB+(size_t)t*F, uB+(size_t)t*F, dw1, actB+(size_t)t*F, F, st);
+        bmm(actB, w.down_q, w.down_qtype, rtB, N, H, F);
+
+        const void* nextnorm = (L+1 < c.n_layers) ? s.w.layers[L+1].input_norm : s.w.final_norm;
+        kernels::launch_add_rmsnorm2(hB, rtB, nextnorm, xB, xnB, N, H, c.rms_eps, st);
+    }
+    cudaStreamSynchronize(st);
+    for (void* p : {(void*)xB,(void*)xnB,(void*)hB,(void*)hnB,(void*)aoB,(void*)rtB,(void*)lqkvB,(void*)lzB,
+                    (void*)laB,(void*)lbB,(void*)lnB,(void*)qB,(void*)kB,(void*)vB,(void*)atB,(void*)gB,
+                    (void*)uB,(void*)actB,(void*)wbuf,(void*)tokB,(void*)dw1}) cudaFree(p);
 }
 
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
