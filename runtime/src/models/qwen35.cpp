@@ -1072,9 +1072,13 @@ void Qwen35Model::forward_prefill_chunk(int N) {
     const bool kv8 = s.kv->int8_kv();
     const int kv_elem = kv8 ? 1 : 2;
     const float attn_scale = 1.f / sqrtf((float)c.head_dim);
+    if (s.n_splits <= 0 || s.n_splits > Impl::MAX_NSPLITS) s.n_splits = 32;   // valid for flash-decode grid
+    const bool dbg = getenv("PFDBG") != nullptr;
 
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
+        auto ck = [&](const char* tag){ if (dbg && L<=3){ cudaError_t e=cudaDeviceSynchronize();
+            fprintf(stderr, "[pf-ck] L%d %-10s -> %s\n", L, tag, cudaGetErrorString(e)); } };
         if (w.linear_attn) {
             bmm(xnB, w.wqkv,      w.wqkv_type,      lqkvB, N, lqkv, H);
             bmm(xnB, w.wqkv_gate, w.wqkv_gate_type, lzB,  N, lvd,  H);
@@ -1090,12 +1094,12 @@ void Qwen35Model::forward_prefill_chunk(int N) {
                 kernels::launch_qwen36_gated_norm(s.lin_gdn, lzB+(size_t)t*lvd, w.ssm_norm, lnB+(size_t)t*lvd,
                     lvh, c.linear_head_dim, c.rms_eps, st);
             }
-            bmm(lnB, w.ssm_out, w.ssm_out_type, aoB, N, H, lvd);
+            bmm(lnB, w.ssm_out, w.ssm_out_type, aoB, N, H, lvd); ck("gdn");
         } else {
             const int nq = w.q_has_gate ? qdim*2 : qdim;
             bmm(xnB, w.wq, w.wq_type, qB, N, nq,    H);
             bmm(xnB, w.wk, w.wk_type, kB, N, kvdim, H);
-            bmm(xnB, w.wv, w.wv_type, vB, N, kvdim, H);
+            bmm(xnB, w.wv, w.wv_type, vB, N, kvdim, H); ck("attn-proj");
             void* kpool=(char*)s.kv->k_pool()+(size_t)L*s.kv->layer_stride_elems()*kv_elem;
             void* vpool=(char*)s.kv->v_pool()+(size_t)L*s.kv->layer_stride_elems()*kv_elem;
             void* kscale=kv8?(char*)s.kv->k_scale_pool()+(size_t)L*s.kv->scale_layer_stride_elems()*2:nullptr;
@@ -1115,16 +1119,16 @@ void Qwen35Model::forward_prefill_chunk(int N) {
                     s.kv->block_size(), s.kv->max_blocks_per_seq(), s.n_splits, attn_scale, st,
                     nullptr, t+1, kscale, vscale, kv8?1:0, nullptr);
             }
-            bmm(atB, w.wo, w.wo_type, aoB, N, H, qdim);
+            ck("attn-loop"); bmm(atB, w.wo, w.wo_type, aoB, N, H, qdim); ck("attn-wo");
         }
-        kernels::launch_add_rmsnorm2(xB, aoB, w.post_attn_norm, hB, hnB, N, H, c.rms_eps, st);
+        kernels::launch_add_rmsnorm2(xB, aoB, w.post_attn_norm, hB, hnB, N, H, c.rms_eps, st); ck("postnorm");
 
         // dense FFN, batched: gate/up GEMM -> swiglu -> down GEMM
         bmm(hnB, w.gate_q, w.gate_qtype, gB, N, F, H);
         bmm(hnB, w.up_q,   w.up_qtype,   uB, N, F, H);
         for (int t = 0; t < N; t++)
             kernels::launch_qwen36_shared_swiglu(gB+(size_t)t*F, uB+(size_t)t*F, dw1, actB+(size_t)t*F, F, st);
-        bmm(actB, w.down_q, w.down_qtype, rtB, N, H, F);
+        bmm(actB, w.down_q, w.down_qtype, rtB, N, H, F); ck("ffn");
 
         const void* nextnorm = (L+1 < c.n_layers) ? s.w.layers[L+1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(hB, rtB, nextnorm, xB, xnB, N, H, c.rms_eps, st);
