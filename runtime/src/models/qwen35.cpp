@@ -1154,7 +1154,10 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         const int Nv = context_tokens > 0 ? std::min(context_tokens, 512) : 256;
         const int V = s.cfg.vocab;
         std::vector<float> A(V), B(V);
+        cudaGetLastError();
         forward_prefill_chunk(Nv);                                   // batched -> s.logits
+        cudaError_t eb = cudaDeviceSynchronize();
+        fprintf(stderr, "[prefill-validate] after batched: cuda=%s\n", cudaGetErrorString(eb));
         cudaMemcpy(B.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
         s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
         if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
