@@ -1153,11 +1153,23 @@ void Qwen35Model::forward_prefill_chunk(int N) {
         kernels::launch_add_rmsnorm2(xB, aoB, w.post_attn_norm, hB, hnB, N, H, c.rms_eps, st); ck("postnorm");
 
         // dense FFN, batched: gate/up GEMM -> swiglu -> down GEMM
-        bmm(hnB, w.gate_q, w.gate_qtype, gB, N, F, H);
-        bmm(hnB, w.up_q,   w.up_qtype,   uB, N, F, H);
-        for (int t = 0; t < N; t++)
-            kernels::launch_qwen36_shared_swiglu(gB+(size_t)t*F, uB+(size_t)t*F, dw1, actB+(size_t)t*F, F, st);
-        bmm(actB, w.down_q, w.down_qtype, rtB, N, H, F); ck("ffn");
+        static int reffn=-1; if(reffn<0){const char*e=getenv("SPARKINFER_PREFILL_REFFFN"); reffn=(e&&e[0]=='1')?1:0;}
+        if (reffn) {   // reference: exact decode dense FFN per token (moe_expert_ffn_q4k)
+            int zi=0; float wi=1.f;
+            cudaMemcpy(s.mf_ids, &zi, sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(s.mf_weights, &wi, sizeof(float), cudaMemcpyHostToDevice);
+            for (int t=0;t<N;t++)
+                kernels::launch_moe_expert_ffn_q4k(hnB+(size_t)t*H, w.gate_q, w.up_q, w.down_q,
+                    w.gate_qtype, w.up_qtype, w.down_qtype, s.mf_ids, s.mf_weights, rtB+(size_t)t*H,
+                    s.mf_h, s.mf_out, 1, c.top_k, H, F, nullptr, st);
+        } else {
+            bmm(hnB, w.gate_q, w.gate_qtype, gB, N, F, H);
+            bmm(hnB, w.up_q,   w.up_qtype,   uB, N, F, H);
+            for (int t = 0; t < N; t++)
+                kernels::launch_qwen36_shared_swiglu(gB+(size_t)t*F, uB+(size_t)t*F, dw1, actB+(size_t)t*F, F, st);
+            bmm(actB, w.down_q, w.down_qtype, rtB, N, H, F);
+        }
+        ck("ffn");
 
         const void* nextnorm = (L+1 < c.n_layers) ? s.w.layers[L+1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(hB, rtB, nextnorm, xB, xnB, N, H, c.rms_eps, st);
