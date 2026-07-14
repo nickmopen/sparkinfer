@@ -1160,10 +1160,11 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
         if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
         for (int t = 0; t < Nv; t++) (void)forward_token((t*131+7)%s.cfg.vocab, t);  // seq, SAME varied ids -> s.logits
         cudaMemcpy(A.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
-        int amA=0, amB=0; double kl=0, mx=0;
-        for (int i=0;i<V;i++){ if(A[i]>A[amA])amA=i; if(B[i]>B[amB])amB=i; mx=std::max(mx,(double)std::fabs(A[i]-B[i])); }
-        fprintf(stderr, "[prefill-validate] N=%d seq_argmax=%d batched_argmax=%d max|dlogit|=%.4f -> %s\n",
-                Nv, amA, amB, mx, amA==amB ? "ARGMAX MATCH" : "ARGMAX MISMATCH");
+        int amA=0, amB=0; double mx=0, maxA=0, maxB=0;
+        for (int i=0;i<V;i++){ if(A[i]>A[amA])amA=i; if(B[i]>B[amB])amB=i;
+            mx=std::max(mx,(double)std::fabs(A[i]-B[i])); maxA=std::max(maxA,(double)std::fabs(A[i])); maxB=std::max(maxB,(double)std::fabs(B[i])); }
+        fprintf(stderr, "[prefill-validate] N=%d  seq argmax=%d(%.3f) maxabs=%.3f | batched argmax=%d(%.3f) maxabs=%.3f | max|dlogit|=%.4f -> %s\n",
+                Nv, amA, A[amA], maxA, amB, B[amB], maxB, mx, amA==amB ? "ARGMAX MATCH" : "ARGMAX MISMATCH");
         s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
         if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
     }
