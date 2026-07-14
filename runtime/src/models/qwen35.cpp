@@ -1101,7 +1101,8 @@ void Qwen35Model::forward_prefill_chunk(int N) {
             bf16* conv_state = s.lin_conv_state + (size_t)L*(c.linear_conv_kernel-1)*s.linear_qkvdim;
             float* lstate = s.lin_state + (size_t)L*lvh*c.linear_head_dim*c.linear_head_dim;
             for (int t = 0; t < N; t++) {   // GDN recurrence: per-token, state carries
-                kernels::launch_qwen36_conv_split_l2(lqkvB+(size_t)t*lqkv, w.ssm_conv, conv_state,
+                // Qwythos shape (head_dim 128, 16 q / 32 v heads) uses the FUSED conv+l2norm in decode.
+                kernels::launch_qwen36_conv_split_l2norm_fused(lqkvB+(size_t)t*lqkv, w.ssm_conv, conv_state,
                     s.lin_q, s.lin_k, s.lin_v, c.linear_q_heads, lvh, c.linear_head_dim, c.linear_conv_kernel, c.rms_eps, st);
                 kernels::launch_qwen36_gdn_ar(s.lin_q, s.lin_k, s.lin_v, laB+(size_t)t*lvh, lbB+(size_t)t*lvh,
                     w.ssm_dt, w.ssm_a, lstate, s.lin_gdn, c.linear_q_heads, lvh, c.linear_head_dim, st);
