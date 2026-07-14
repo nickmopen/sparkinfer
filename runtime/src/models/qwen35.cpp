@@ -1127,6 +1127,17 @@ void Qwen35Model::forward_prefill_chunk(int N) {
         const void* nextnorm = (L+1 < c.n_layers) ? s.w.layers[L+1].input_norm : s.w.final_norm;
         kernels::launch_add_rmsnorm2(hB, rtB, nextnorm, xB, xnB, N, H, c.rms_eps, st);
     }
+    // last-token logits (into s.logits) — for validation + to seed decode.
+    const bf16* xn_last = xnB + (size_t)(N-1)*H;
+    if (s.gguf && s.w.lm_head_type == 12) {
+        kernels::launch_quantize_q8_1_blocks(xn_last, s.aq81, H, st);
+        kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    } else if (s.gguf && s.w.lm_head_type) {
+        kernels::launch_gemv_q_f32(xn_last, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+    } else if (s.gguf) {
+        kernels::launch_gemv_f32(xn_last, s.w.lm_head, s.logits, c.vocab, H, st);
+    }
+    kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
     cudaStreamSynchronize(st);
     for (void* p : {(void*)xB,(void*)xnB,(void*)hB,(void*)hnB,(void*)aoB,(void*)rtB,(void*)lqkvB,(void*)lzB,
                     (void*)laB,(void*)lbB,(void*)lnB,(void*)qB,(void*)kB,(void*)vB,(void*)atB,(void*)gB,
@@ -1137,6 +1148,23 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     BenchDecodeResult out{};
     Impl& s = *p_;
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return out; }
+    if (getenv("SPARKINFER_PREFILL_VALIDATE")) {
+        const int Nv = context_tokens > 0 ? std::min(context_tokens, 512) : 256;
+        const int V = s.cfg.vocab;
+        std::vector<float> A(V), B(V);
+        forward_prefill_chunk(Nv);                                   // batched -> s.logits
+        cudaMemcpy(B.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
+        s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
+        if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
+        for (int t = 0; t < Nv; t++) (void)forward_token(0, t);      // sequential (same token 0) -> s.logits
+        cudaMemcpy(A.data(), s.logits, (size_t)V*4, cudaMemcpyDeviceToHost);
+        int amA=0, amB=0; double kl=0, mx=0;
+        for (int i=0;i<V;i++){ if(A[i]>A[amA])amA=i; if(B[i]>B[amB])amB=i; mx=std::max(mx,(double)std::fabs(A[i]-B[i])); }
+        fprintf(stderr, "[prefill-validate] N=%d seq_argmax=%d batched_argmax=%d max|dlogit|=%.4f -> %s\n",
+                Nv, amA, amB, mx, amA==amB ? "ARGMAX MATCH" : "ARGMAX MISMATCH");
+        s.kv->free(s.seq_id); s.kv->allocate(s.seq_id, s.cfg.max_seq);
+        if (s.graph_ready) { cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph); s.graph_ready = false; }
+    }
     int start_pos = context_tokens;
     if (const char* e = getenv("SPARKINFER_BENCH_START_POS")) {
         start_pos = atoi(e);
