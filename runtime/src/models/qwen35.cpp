@@ -1079,6 +1079,11 @@ void Qwen35Model::forward_prefill_chunk(int N) {
         kernels::launch_gemm(x, wbuf, y, M, Nout, K, 1.f, 0.f, gc, st);
     };
 
+    // GDN recurrence starts at position 0 -> zero the linear + conv state (forward_token does this at pos==0).
+    if (c.hybrid) {
+        cudaMemsetAsync(s.lin_state, 0, (size_t)c.n_layers*lvh*c.linear_head_dim*c.linear_head_dim*sizeof(float), st);
+        cudaMemsetAsync(s.lin_conv_state, 0, (size_t)c.n_layers*(c.linear_conv_kernel-1)*s.linear_qkvdim*sizeof(bf16), st);
+    }
     kernels::launch_embedding(tokB, s.w.embed_tokens, xB, N, H, st);
     kernels::launch_rmsnorm(xB, s.w.layers[0].input_norm, xnB, N, H, c.rms_eps, st);
 
