@@ -1169,7 +1169,8 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     Impl& s = *p_;
     if (!s.kv->allocate(s.seq_id, s.cfg.max_seq)) { fprintf(stderr, "[bench] kv allocate failed\n"); return out; }
     if (getenv("SPARKINFER_PREFILL_VALIDATE")) {
-        const int Nv = context_tokens > 0 ? std::min(context_tokens, 512) : 256;
+        const int Nv = getenv("SPARKINFER_PREFILL_VN") ? atoi(getenv("SPARKINFER_PREFILL_VN"))
+                                                       : (context_tokens > 0 ? std::min(context_tokens, 512) : 256);
         const int V = s.cfg.vocab;
         std::vector<float> A(V), B(V);
         cudaGetLastError();
