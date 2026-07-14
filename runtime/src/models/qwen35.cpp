@@ -1060,7 +1060,20 @@ void Qwen35Model::forward_prefill_chunk(int N) {
     float* dw1=(float*)D(sizeof(float)); { float one=1.f; cudaMemcpyAsync(dw1,&one,sizeof(float),cudaMemcpyHostToDevice,st); }
 
     // batched Q4_K/Q6_K/Q8_0 matmul: y[M,Nout] = x[M,K] @ W (W is GGUF [Nout,K] == [K,Nout] col-major)
+    static int refmm = -1; if (refmm < 0){ const char* e=getenv("SPARKINFER_PREFILL_REFMM"); refmm=(e&&e[0]=='1')?1:0; }
     auto bmm = [&](const bf16* x, const void* W, int t, bf16* y, int M, int Nout, int K){
+        if (refmm) {   // reference: per-token int8 MMVQ (matches decode numerics exactly)
+            for (int m = 0; m < M; m++) {
+                const bf16* xm = x+(size_t)m*K; bf16* ym = y+(size_t)m*Nout;
+                if (t==12 || t==14 || t==8) {
+                    kernels::launch_quantize_q8_1_blocks(xm, s.aq81, K, st);
+                    if (t==12) kernels::launch_mmvq_q4k(s.aq81, W, ym, Nout, K, st);
+                    else if (t==14) kernels::launch_mmvq_q6k(s.aq81, W, ym, Nout, K, st);
+                    else kernels::launch_mmvq_q80(s.aq81, W, ym, Nout, K, st);
+                } else { kernels::launch_gguf_dequant(t, W, wbuf, (long)Nout*K, st); kernels::launch_gemm(xm, wbuf, ym, 1, Nout, K, 1.f, 0.f, gc, st); }
+            }
+            return;
+        }
         kernels::launch_gguf_dequant(t, W, wbuf, (long)Nout*K, st);
         kernels::launch_gemm(x, wbuf, y, M, Nout, K, 1.f, 0.f, gc, st);
     };
