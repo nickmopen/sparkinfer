@@ -90,7 +90,10 @@ public:
                               ThermalGovernor* gov = nullptr);
 
     // Run one token at `position`, return the argmax next-token id.
-    int forward_token(int token_id, int position);
+    // fill_only=true: KV-fill for prefill — runs embed->layers but SKIPS the lm-head/argmax
+    // tail (prefill discards per-token logits), replayed from a separate "fill" CUDA graph.
+    // Decode (fill_only=false) is byte-identical to before. Returns the sampled id (fill: token_id).
+    int forward_token(int token_id, int position, bool fill_only = false);
 
     // Copy the most recent step's logits (vocab floats) to host. Valid after a
     // forward_token() call. Used for teacher-forced scoring (perplexity / KL).

@@ -116,6 +116,14 @@ struct Qwen35Model::Impl {
     cudaGraph_t cu_graph{};
     cudaGraphExec_t cu_exec{};
     bool graph_ready = false;
+    // Prefill "fill" graph: identical embed->layers KV fill but WITHOUT the lm-head/argmax
+    // tail (prefill discards per-token logits). Decode uses cu_graph (byte-identical); prefill
+    // uses cu_exec_fill. Both invalidate together on any n_splits/attn-mode/sparse change.
+    cudaGraph_t cu_graph_fill{};
+    cudaGraphExec_t cu_exec_fill{};
+    bool graph_fill_ready = false;
+    int graph_fill_nsplits = -1, graph_fill_attn_mode = -1;   // config the fill graph was captured at
+    bool graph_fill_sparse = false;
     bool bench_feedback_graph = false;
     int graph_attn_mode = -1;  // host-side flash-decode dispatch class captured in cu_graph
 
@@ -320,6 +328,7 @@ Qwen35Model::~Qwen35Model() {
     cudaFree(p_->sparse_sel);
     cudaFree(p_->aq8); cudaFree(p_->aq8_d); cudaFree(p_->aq8_s); cudaFree(p_->aq81);
     if (p_->graph_ready) { cudaGraphExecDestroy(p_->cu_exec); cudaGraphDestroy(p_->cu_graph); }
+    if (p_->graph_fill_ready) { cudaGraphExecDestroy(p_->cu_exec_fill); cudaGraphDestroy(p_->cu_graph_fill); }
     cudaEventDestroy(p_->ev_qkv); cudaEventDestroy(p_->ev_k); cudaEventDestroy(p_->ev_v);
     cudaEventDestroy(p_->ev_pipe_fork); cudaEventDestroy(p_->ev_gdn_z); cudaEventDestroy(p_->ev_gdn_ab);
     cudaEventDestroy(p_->ev_sx_gate); cudaEventDestroy(p_->ev_sx_done);
@@ -337,10 +346,19 @@ void Qwen35Model::copy_logits(float* host_logits) const {
     cudaMemcpy(host_logits, p_->logits, (size_t)p_->cfg.vocab * sizeof(float), cudaMemcpyDeviceToHost);
 }
 
-int Qwen35Model::forward_token(int token_id, int position) {
+int Qwen35Model::forward_token(int token_id, int position, bool fill_only) {
     Impl& s = *p_;
     const Qwen35Config& c = s.cfg;
     const int H = c.hidden;
+    // Any config change below invalidates the full graph; the fill graph shares the exact same
+    // embed->layers body, so it must invalidate on the same conditions. Destroy it here whenever
+    // the full graph is torn down (checked after each invalidation block via this lambda).
+    auto invalidate_fill = [&]() {
+        if (s.graph_fill_ready) {
+            cudaGraphExecDestroy(s.cu_exec_fill); cudaGraphDestroy(s.cu_graph_fill);
+            s.cu_exec_fill = nullptr; s.cu_graph_fill = nullptr; s.graph_fill_ready = false;
+        }
+    };
     kernels::GemmConfig gc{};
     int seqlen = position + 1;
     cudaStream_t st = s.stream;
@@ -442,8 +460,18 @@ int Qwen35Model::forward_token(int token_id, int position) {
     // Capture the decode compute into a CUDA graph on the first token, then
     // replay it every token (per-token inputs live in the d_tok/pos/seqlen/
     // writepos device buffers uploaded above, so replay produces fresh results).
-    if (s.graph_ready) {
-        cu(cudaGraphLaunch(s.cu_exec, st), "graph launch");
+    // The fill graph invalidates independently: during prefill the full graph may never be ready,
+    // so the full-graph invalidation checks above won't fire. Re-capture the fill graph if the
+    // config it was captured at (n_splits/attn-mode/sparse) has drifted.
+    if (fill_only && s.graph_fill_ready &&
+        (s.graph_fill_nsplits != s.n_splits || s.graph_fill_attn_mode != attn_graph_mode ||
+         s.graph_fill_sparse != sparse_on))
+        invalidate_fill();
+
+    const bool ready = fill_only ? s.graph_fill_ready : s.graph_ready;
+    if (ready) {
+        cu(cudaGraphLaunch(fill_only ? s.cu_exec_fill : s.cu_exec, st), "graph launch");
+        if (fill_only) return token_id;   // KV filled; prefill discards per-token logits
         cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
         cu(cudaStreamSynchronize(st), "sync");
         return *s.h_out_id;
@@ -993,26 +1021,36 @@ int Qwen35Model::forward_token(int token_id, int position) {
         else
             kernels::launch_add_rmsnorm2(s.h, s.routed, nextnorm, s.x, s.xn, 1, H, c.rms_eps, st);
     }
-    // xn now holds RMSNorm(x_final, final_norm)
-    if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
-        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
-        kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+    // xn now holds RMSNorm(x_final, final_norm). Prefill (fill_only) discards per-token logits,
+    // so the lm-head + argmax + feedback are captured ONLY into the full (decode) graph.
+    if (!fill_only) {
+        if (s.gguf && s.use_pq && s.use_llama && s.w.lm_head_type == 12) {
+            if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);
+            kernels::launch_mmvq_q4k_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+        }
+        else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
+            if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
+            kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
+        }
+        else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
+        else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
+        else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
+        kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
+        if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
     }
-    else if (s.gguf && s.use_q6mmvq && s.w.lm_head_type == 14) {   // int8 Q6_K dp4a LM head (1 warp/row)
-        if (!fnq) kernels::launch_quantize_q8_1_blocks(s.xn, s.aq81, H, st);  // else aq81 = Q8_1(xn) from final norm
-        kernels::launch_gemv_q6k_dp4a_f32(s.aq81, s.w.lm_head, s.logits, c.vocab, H, st);
-    }
-    else if (s.gguf && s.w.lm_head_type) kernels::launch_gemv_q_f32(s.xn, s.w.lm_head, s.w.lm_head_type, s.logits, c.vocab, H, st);
-    else if (s.gguf)                kernels::launch_gemv_f32(s.xn, s.w.lm_head, s.logits, c.vocab, H, st);  // lm_head native [vocab,H]
-    else        kernels::launch_linear_f32(s.xn, s.w.lm_head, s.logits, 1, c.vocab, H, st);
-    kernels::launch_argmax(s.logits, s.d_out_id, 1, c.vocab, st);
-    if (s.bench_feedback_graph) kernels::launch_decode_feedback(s.d_scalars, s.d_out_id, st);
 
-    cu(cudaStreamEndCapture(st, &s.cu_graph), "end capture");
-    cu(cudaGraphInstantiate(&s.cu_exec, s.cu_graph, 0), "graph instantiate");
-    s.graph_ready = true;
-    s.graph_attn_mode = attn_graph_mode;
-    s.graph_sparse = sparse_on;
+    cudaGraph_t& cap_g = fill_only ? s.cu_graph_fill : s.cu_graph;
+    cudaGraphExec_t& cap_e = fill_only ? s.cu_exec_fill : s.cu_exec;
+    cu(cudaStreamEndCapture(st, &cap_g), "end capture");
+    cu(cudaGraphInstantiate(&cap_e, cap_g, 0), "graph instantiate");
+    if (fill_only) {
+        s.graph_fill_ready = true;
+        s.graph_fill_nsplits = s.n_splits; s.graph_fill_attn_mode = attn_graph_mode; s.graph_fill_sparse = sparse_on;
+    } else {
+        s.graph_ready = true;
+        s.graph_attn_mode = attn_graph_mode;
+        s.graph_sparse = sparse_on;
+    }
     static int graph_dbg = -1;
     if (graph_dbg < 0) {
         const char* e = getenv("SPARKINFER_GRAPH_DEBUG");
@@ -1023,7 +1061,8 @@ int Qwen35Model::forward_token(int token_id, int position) {
         fprintf(stderr, "[graph] capture pos=%d seqlen=%d n_splits=%d attn_mode=%d mma_chunk=%d sparse=%d\n",
                 position, seqlen, s.n_splits, attn_graph_mode, mma_chunk, sparse_on ? 1 : 0);
     }
-    cu(cudaGraphLaunch(s.cu_exec, st), "graph launch (first)");
+    cu(cudaGraphLaunch(cap_e, st), "graph launch (first)");
+    if (fill_only) return token_id;   // KV filled; prefill discards per-token logits
 
     cu(cudaMemcpyAsync(s.h_out_id, s.d_out_id, sizeof(int), cudaMemcpyDeviceToHost, st), "out_id");
     cu(cudaStreamSynchronize(st), "sync");
@@ -1054,7 +1093,7 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     int pos = 0, tok = 100;
     if (start_pos > 0) {
         auto p0 = std::chrono::high_resolution_clock::now();
-        for (; pos < start_pos; pos++) { tok = forward_token(tok, pos); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
+        for (; pos < start_pos; pos++) { tok = forward_token(tok, pos, /*fill_only=*/true); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
         cudaDeviceSynchronize();
         auto p1 = std::chrono::high_resolution_clock::now();
         out.prefill_pp = start_pos / std::chrono::duration<double>(p1 - p0).count();
@@ -1103,7 +1142,9 @@ std::vector<int> Qwen35Model::generate(const std::vector<int>& prompt, int max_n
         return out;
     }
     int next = -1;
-    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i);
+    // Fill all prompt positions with the lm-head skipped; the LAST token runs full so its
+    // logits seed generation.
+    for (size_t i = 0; i < prompt.size(); i++) next = forward_token(prompt[i], (int)i, i + 1 < prompt.size());
     for (int i = 0; i < max_new; i++) {
         out.push_back(next);
         if (next == s.cfg.eos_id) break;
