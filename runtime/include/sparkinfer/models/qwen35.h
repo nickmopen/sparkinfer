@@ -108,6 +108,11 @@ public:
 private:
     struct Impl;
     Impl* p_;
+
+    // Batched prefill: fill the KV cache for positions [0, n_tokens) in one layer-major
+    // pass (batched projection/FFN GEMMs) instead of n_tokens per-token decode replays.
+    // Selected by SPARKINFER_PREFILL=batched; default keeps the per-token sequential fill.
+    void forward_prefill_chunk(int n_tokens);
 };
 
 } // namespace sparkinfer

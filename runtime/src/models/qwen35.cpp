@@ -1030,6 +1030,13 @@ int Qwen35Model::forward_token(int token_id, int position) {
     return *s.h_out_id;
 }
 
+// Batched prefill entry. STAGE 0: sequential fallback (correctness baseline + compile scaffold).
+// Stage 1a replaces this body with a layer-major batched forward: batched projections + dense-FFN
+// GEMMs (weights read once per layer), attention + GDN kept per-token. Fills KV for [0, n_tokens).
+void Qwen35Model::forward_prefill_chunk(int n_tokens) {
+    for (int p = 0; p < n_tokens; p++) (void)forward_token(100, p);
+}
+
 Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int context_tokens) {
     BenchDecodeResult out{};
     Impl& s = *p_;
@@ -1054,7 +1061,10 @@ Qwen35Model::BenchDecodeResult Qwen35Model::bench_decode(int warmup, int n, int 
     int pos = 0, tok = 100;
     if (start_pos > 0) {
         auto p0 = std::chrono::high_resolution_clock::now();
-        for (; pos < start_pos; pos++) { tok = forward_token(tok, pos); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
+        static int pf_batched = -1;
+        if (pf_batched < 0) { const char* ev = getenv("SPARKINFER_PREFILL"); pf_batched = (ev && ev[0] == 'b') ? 1 : 0; }
+        if (pf_batched) { forward_prefill_chunk(start_pos); pos = start_pos; tok = 100; }
+        else for (; pos < start_pos; pos++) { tok = forward_token(tok, pos); if (tok < 0 || tok >= s.cfg.vocab) tok = 100; }
         cudaDeviceSynchronize();
         auto p1 = std::chrono::high_resolution_clock::now();
         out.prefill_pp = start_pos / std::chrono::duration<double>(p1 - p0).count();
